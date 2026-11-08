@@ -276,9 +276,10 @@ fn aligner_labels(ipa: &str, next: Option<&str>) -> Option<Vec<&'static str>> {
         "ɔ" => one("ɒː"),
         "ʊ" => one("ʊ"),
         "u" => one("ʉː"),
-        "ʌ" | "ɐ" => one("ɐ"),
-        // our NURSE is written ə, so either may be what was said
-        "ə" => Some(vec!["ə", "ɜː"]),
+        "ʌ" => one("ɐ"),
+        // ɐ carries NURSE here: the engine has no other spare vowel for it
+        "ɐ" => one("ɜː"),
+        "ə" => one("ə"),
         "p" => one(if front { "pʲ" } else if vowel { "pʰ" } else { "p" }),
         "t" if front => one("tʲ"),
         "t" if vowel => one("tʰ"),
@@ -349,7 +350,7 @@ fn plan_take(g2p: &EnglishG2P, text: &str) -> Result<Planned, String> {
     if phrases.is_empty() {
         return Err("no words".to_string());
     }
-    let phrases = crate::british::southern_british(g2p, &phrases, "male", 112.0, false)?;
+    let phrases = crate::british::southern_british(g2p, &phrases, "male", 112.0, true)?;
     let planned = plan(&inputs(&phrases), "male", 112.0);
     let spans = seg_spans(&phrases, &planned.segments)?;
     let labels = phone_labels(&phrases, &planned, &spans);
@@ -649,6 +650,19 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
     }
     let mean: HashMap<u8, [f64; ORDER]> = totals.iter().map(|(p, (s, n))| (*p, s.map(|v| v / *n as f64))).collect();
     let distance = |f: &Frame, m: &[f64; ORDER]| -> f64 { (0..ORDER).map(|k| (f.lsf[k] as f64 - m[k]).abs()).sum() };
+    // how loud each sound usually is where joins meet it, so stored pieces can agree at their ends
+    let mut edge_gains: HashMap<u8, Vec<u8>> = HashMap::new();
+    for c in &candidates {
+        edge_gains.entry(id[&c.a]).or_default().push(c.frames[0].gain);
+        edge_gains.entry(id[&c.b]).or_default().push(c.frames[c.frames.len() - 1].gain);
+    }
+    let usual_gain: HashMap<u8, f64> = edge_gains
+        .into_iter()
+        .map(|(p, mut g)| {
+            g.sort_unstable();
+            (p, g[g.len() / 2] as f64)
+        })
+        .collect();
     let mut groups: BTreeMap<(u8, u8), Vec<Candidate>> = BTreeMap::new();
     for c in candidates {
         groups.entry((id[&c.a], id[&c.b])).or_default().push(c);
@@ -681,9 +695,15 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
     let mut frames_bytes = Vec::new();
     for ((a, b), (_, c)) in &best {
         index.push(Entry { a: *a, b: *b, offset: (frames_bytes.len() / FRAME_BYTES) as u32, frames: c.frames.len() as u16, join: c.join as u16 });
-        for f in &c.frames {
+        // a piece from the end of a sentence is much quieter than one from the middle: bring each
+        // end to its sound's usual level, ramping across the piece so its own shape survives
+        let left = (usual_gain[a] - c.frames[0].gain as f64).clamp(-48.0, 48.0);
+        let right = (usual_gain[b] - c.frames[c.frames.len() - 1].gain as f64).clamp(-48.0, 48.0);
+        let last = (c.frames.len() - 1).max(1) as f64;
+        for (i, f) in c.frames.iter().enumerate() {
+            let t = i as f64 / last;
             frames_bytes.extend_from_slice(&f.lsf);
-            frames_bytes.push(f.gain);
+            frames_bytes.push((f.gain as f64 + left * (1.0 - t) + right * t).round().clamp(0.0, 255.0) as u8);
             frames_bytes.push(f.voiced);
         }
     }
@@ -882,7 +902,7 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
     if phrases.is_empty() {
         return Err("nothing to say".to_string());
     }
-    let phrases = crate::british::southern_british(g2p, &phrases, "male", 112.0, false)?;
+    let phrases = crate::british::southern_british(g2p, &phrases, "male", 112.0, true)?;
     let planned = plan(&inputs(&phrases), "male", 112.0);
     let spans = seg_spans(&phrases, &planned.segments)?;
     let labels = phone_labels(&phrases, &planned, &spans);
@@ -1238,7 +1258,7 @@ pub fn select_prompts(pool_path: &str, out_path: &str, count: usize) -> Result<(
         if phrases.is_empty() {
             continue;
         }
-        let phrases = crate::british::southern_british(&g2p, &phrases, "male", 112.0, false)?;
+        let phrases = crate::british::southern_british(&g2p, &phrases, "male", 112.0, true)?;
         let p = plan(&inputs(&phrases), "male", 112.0);
         let phones: Vec<String> = p.segments.iter().map(|s| s.ipa.clone()).collect();
         let joins: HashSet<(String, String)> = phones.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect();

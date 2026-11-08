@@ -76,6 +76,10 @@ fn rewrite(g2p: &EnglishG2P, phrase: &Phrase) -> Vec<Out> {
             "ɾ" if same_shape => seg.ipa = base[i].ipa.clone(),
             // these keep their vowel even unstressed: a bare schwa is heard as a stray "uh"
             "ɚ" | "ə" if w == "or" || w == "nor" => seg.ipa = "ɔ".to_string(),
+            // the dictionary's American or weak forms that southern English doesn't use
+            "ə" if w == "on" => seg.ipa = "ɒ".to_string(),
+            "ə" if matches!(w, "would" | "could" | "should") => seg.ipa = "ʊ".to_string(),
+            "ʌ" if matches!(w, "what" | "what's" | "because") => seg.ipa = "ɒ".to_string(),
             "ɚ" | "ɝ" => {
                 if vowel_next {
                     // "water all", "hurry": the /r/ survives before a vowel
@@ -97,7 +101,8 @@ fn rewrite(g2p: &EnglishG2P, phrase: &Phrase) -> Vec<Out> {
             // "the air" is "thee air"
             "ə" if w == "the" && s.word_end == Some(true) && vowel_next => seg.ipa = "i".to_string(),
             // "passage", "village": southern English has ɪ here
-            "ə" if s.stress != Some(1) && segs.get(i + 1).is_some_and(|n| n.ipa == "dʒ" && n.word_end == Some(true)) => seg.ipa = "ɪ".to_string(),
+            // and "rabbit", "wanted", "horses"
+            "ə" if s.stress != Some(1) && segs.get(i + 1).is_some_and(|n| n.word_end == Some(true) && (n.ipa == "dʒ" || (n.ipa == "t" && w.ends_with("it")) || (n.ipa == "d" && w.ends_with("ed")) || (n.ipa == "z" && w.ends_with("es")))) => seg.ipa = "ɪ".to_string(),
             "æ" if long_a(w) => seg.ipa = "ɑ".to_string(),
             "ɑ" if !coda_r_next && !long_a(w) => seg.ipa = "ɒ".to_string(),
             "ɔ" if segs.get(i + 1).is_some_and(|n| ["f", "θ", "s", "ŋ", "g"].contains(&n.ipa.as_str())) => seg.ipa = "ɒ".to_string(),
@@ -106,7 +111,8 @@ fn rewrite(g2p: &EnglishG2P, phrase: &Phrase) -> Vec<Out> {
         if s.word_end == Some(true) {
             word += 1;
         }
-        out.push(Out { seg, split, nurse, stretch: 1.0 });
+        // NURSE is a long vowel; written as a schwa it was as short as one
+        out.push(Out { seg, split, nurse, stretch: if nurse { 1.6 } else { 1.0 } });
     }
     out
 }
@@ -133,7 +139,8 @@ pub fn southern_british(g2p: &EnglishG2P, phrases: &[Phrase], body: &str, f0: f6
                 parts[span.phrase].push(seg);
             }
             None => {
-                seg.dur = Some(dur * out.stretch);
+                // only a voice with its own NURSE sound takes the longer length
+                seg.dur = Some(dur * if out.nurse && !fitted_nurse { 1.0 } else { out.stretch });
                 if out.nurse && fitted_nurse {
                     seg.ipa = "ɐ".to_string();
                 }
