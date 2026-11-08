@@ -692,7 +692,8 @@ impl App {
                 let fixed = self.notes.len() - open;
                 egui::CollapsingHeader::new(format!("Notes ({open} open, {fixed} fixed)")).id_salt("notes").default_open(true).show(ui, |ui| {
                     ui.checkbox(&mut self.show_fixed, "Show fixed");
-                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                    // all the room the window has, less the two status lines under the list
+                    egui::ScrollArea::vertical().max_height((ui.available_height() - 70.0).max(140.0)).show(ui, |ui| {
                         for (i, n) in self.notes.iter().enumerate() {
                             if n.fixed && !self.show_fixed {
                                 continue;
