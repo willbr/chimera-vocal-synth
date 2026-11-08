@@ -488,6 +488,27 @@ fn align_take(take: &Take, times: &Result<PhoneTimes, String>) -> Result<(Vec<Ca
     Ok((out, analysis))
 }
 
+const SHAPE_POINTS: usize = 16;
+
+/// An example's filter and loudness at evenly spaced points, half each side of its join. Near
+/// silent frames count for little (their filter is noise); low resonances count most.
+fn shape(c: &Candidate) -> Vec<f64> {
+    let mut out = Vec::with_capacity(SHAPE_POINTS * (ORDER + 1));
+    let side = |range: &[Frame], out: &mut Vec<f64>| {
+        for p in 0..SHAPE_POINTS / 2 {
+            let f = &range[p * range.len() / (SHAPE_POINTS / 2)];
+            let weight = if f.gain >= 70 { 1.0 } else { 0.2 };
+            for k in 0..ORDER {
+                out.push(f.lsf[k] as f64 * weight * if k < 10 { 1.0 } else { 0.5 });
+            }
+            out.push(f.gain as f64 * weight * 0.5);
+        }
+    };
+    side(&c.frames[..c.join], &mut out);
+    side(&c.frames[c.join..], &mut out);
+    out
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BuildReport {
     pub takes: usize,
@@ -496,6 +517,7 @@ pub struct BuildReport {
     pub frames: usize,
     pub rom_bytes: usize,
     pub failed: usize,
+    pub single_example_joins: usize,
 }
 
 /// Build a voice file from takes. Whisper runs once for all of them.
@@ -570,15 +592,31 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
     }
     let mean: HashMap<u8, [f64; ORDER]> = totals.iter().map(|(p, (s, n))| (*p, s.map(|v| v / *n as f64))).collect();
     let distance = |f: &Frame, m: &[f64; ORDER]| -> f64 { (0..ORDER).map(|k| (f.lsf[k] as f64 - m[k]).abs()).sum() };
-    let mut best: BTreeMap<(u8, u8), (f64, Candidate)> = BTreeMap::new();
+    let mut groups: BTreeMap<(u8, u8), Vec<Candidate>> = BTreeMap::new();
     for c in candidates {
-        let (a, b) = (id[&c.a], id[&c.b]);
-        let score = distance(&c.frames[0], &mean[&a]) + distance(&c.frames[c.frames.len() - 1], &mean[&b]);
-        match best.get(&(a, b)) {
-            Some((s, _)) if *s <= score => {}
-            _ => {
-                best.insert((a, b), (score, c));
-            }
+        groups.entry((id[&c.a], id[&c.b])).or_default().push(c);
+    }
+    let single_example_joins = groups.values().filter(|g| g.len() == 1).count();
+    let mut best: BTreeMap<(u8, u8), (f64, Candidate)> = BTreeMap::new();
+    for ((a, b), group) in groups {
+        let shapes: Vec<Vec<f64>> = group.iter().map(shape).collect();
+        let typical: Vec<f64> = (0..shapes[0].len())
+            .map(|d| {
+                let mut column: Vec<f64> = shapes.iter().map(|s| s[d]).collect();
+                column.sort_by(f64::total_cmp);
+                column[column.len() / 2]
+            })
+            .collect();
+        let score = |k: usize| {
+            let along: f64 = shapes[k].iter().zip(&typical).map(|(x, y)| (x - y).abs()).sum::<f64>() / SHAPE_POINTS as f64;
+            let c = &group[k];
+            along + 0.5 * (distance(&c.frames[0], &mean[&a]) + distance(&c.frames[c.frames.len() - 1], &mean[&b]))
+        };
+        let scores: Vec<f64> = (0..group.len()).map(score).collect();
+        let pick = (0..group.len()).min_by(|x, y| scores[*x].total_cmp(&scores[*y])).unwrap_or(0);
+        let total = scores[pick];
+        if let Some(chosen) = group.into_iter().nth(pick) {
+            best.insert((a, b), (total, chosen));
         }
     }
 
@@ -598,7 +636,7 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
         let _ = std::fs::create_dir_all(dir);
     }
     std::fs::write(out_path, &file).map_err(|e| format!("{out_path}: {e}"))?;
-    Ok(BuildReport { takes: takes.len() - failed, phones: phones.len(), joins: index.len(), frames: frames_bytes.len() / FRAME_BYTES, rom_bytes: file.len(), failed })
+    Ok(BuildReport { takes: takes.len() - failed, phones: phones.len(), joins: index.len(), frames: frames_bytes.len() / FRAME_BYTES, rom_bytes: file.len(), failed, single_example_joins })
 }
 
 fn voice_file(phones: &[String], pulse: &[i16], index: &[Entry], frames_bytes: &[u8]) -> Vec<u8> {

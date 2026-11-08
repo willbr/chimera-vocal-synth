@@ -7,6 +7,9 @@
 #define FRAME_BYTES N64TTS_FRAME_BYTES
 #define ENTRY_BYTES 10
 
+#define SEAM 960 /* samples over which neighbouring joins are blended: 60 ms */
+#define SEAM_MIN_GAIN 70 /* below this a frame is near silence, with no shape worth matching */
+
 typedef long long i64;
 
 /* 2^(k/16) in Q15 */
@@ -193,12 +196,37 @@ static unsigned int min_u(unsigned int a, unsigned int b)
     return a < b ? a : b;
 }
 
+/* Move a frame toward its neighbour across a seam: half the difference at the seam itself, so
+ * both sides arrive at the same value, fading to nothing `width` samples away. */
+static void blend_seam(const unsigned char *mine, const unsigned char *other, unsigned int distance,
+                       unsigned int width, unsigned int *lsf, unsigned int *g)
+{
+    int k, weight, value;
+    if (!mine || !other || distance >= width)
+        return;
+    if (mine[ORDER] < SEAM_MIN_GAIN || other[ORDER] < SEAM_MIN_GAIN)
+        return;
+    weight = (int)(((width - distance) * 128u) / width);
+    for (k = 0; k < ORDER; k++) {
+        value = (int)lsf[k] + ((int)other[k] - (int)mine[k]) * weight;
+        lsf[k] = value < 0 ? 0u : (unsigned int)value;
+    }
+    value = (int)*g + ((int)other[ORDER] - (int)mine[ORDER]) * weight;
+    *g = value < 0 ? 0u : (unsigned int)value;
+}
+
+static const unsigned char *frame_at(const n64tts_voice *v, const half_t *h, unsigned int i)
+{
+    return h->frames ? v->frames + (h->offset + i) * FRAME_BYTES : 0;
+}
+
 void n64tts_render(const n64tts_voice *v, const n64tts_event *events, unsigned int count,
                    const n64tts_params *params, short *out, n64tts_stats *stats)
 {
     i64 a[ORDER], history[ORDER];
     unsigned int lsf[ORDER], interp[ORDER];
     half_t left, right;
+    const unsigned char *prev_end = 0, *this_start = 0, *this_end = 0, *next_start = 0;
     unsigned int n = n64tts_output_len(events, count);
     unsigned int pair = 0, pair_start = 0, half_a = 1, half_b = 1, pos = 0;
     unsigned int head = 0, phase = 0, rng = 0x2545F491u;
@@ -233,6 +261,16 @@ void n64tts_render(const n64tts_voice *v, const n64tts_event *events, unsigned i
             hb = eb->samples / 2;
             if (!have) {
                 find_halves(v, ea->phone, eb->phone, &left, &right, stats);
+                prev_end = this_end;
+                this_start = frame_at(v, &left, 0);
+                this_end = right.frames ? frame_at(v, &right, right.frames - 1) : 0;
+                next_start = 0;
+                if (pair + 2 < count) {
+                    half_t next_left, next_right;
+                    n64tts_stats ignored;
+                    find_halves(v, eb->phone, events[pair + 2].phone, &next_left, &next_right, &ignored);
+                    next_start = frame_at(v, &next_left, 0);
+                }
                 half_a = ha ? ha : 1;
                 half_b = hb ? hb : 1;
                 have = 1;
@@ -263,6 +301,10 @@ void n64tts_render(const n64tts_voice *v, const n64tts_event *events, unsigned i
                 interp[k] = f0p[k] * (256u - frac) + f1p[k] * frac + 128u; /* a byte is (b + 0.5) steps */
             g = f0p[ORDER] * (256u - frac) + f1p[ORDER] * frac;
             voicing = (f0p[ORDER + 1] * (256u - frac) + f1p[ORDER + 1] * frac) >> 8;
+            if (at < half_a)
+                blend_seam(this_start, prev_end, at, min_u(SEAM, half_a), interp, &g);
+            else
+                blend_seam(this_end, next_start, half_a + half_b - 1 - at, min_u(SEAM, half_b), interp, &g);
             /* a different vocal tract length moves every resonance by the same ratio */
             for (k = 0; k < ORDER; k++) {
                 unsigned int w = (unsigned int)clamp64(((i64)interp[k] * params->size) >> 12, 256, 65000);
