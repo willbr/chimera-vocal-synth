@@ -1215,6 +1215,13 @@ fn main() -> Result<(), String> {
             let takes: Vec<voice::Take> = text.lines().filter_map(|l| l.split_once('\t')).map(|(w, t)| voice::Take { wav: w.to_string(), text: t.to_string() }).collect();
             return voice::ladder(&takes, file, out);
         }
+        Some("--pacing") => {
+            // a list of "wav<TAB>text" lines, the voice, and a table of each sound's time in both
+            let (list, file, out) = (args.get(1).ok_or("list file?")?, args.get(2).ok_or("voice file?")?, args.get(3).ok_or("output file?")?);
+            let text = std::fs::read_to_string(list).map_err(|e| format!("{list}: {e}"))?;
+            let takes: Vec<voice::Take> = text.lines().filter_map(|l| l.split_once('\t')).map(|(w, t)| voice::Take { wav: w.to_string(), text: t.to_string() }).collect();
+            return voice::pacing(&takes, file, out);
+        }
         Some("--book-check") => {
             // every sentence of the book through the synth: what breaks, what clips
             let loaded = voice::load(args.get(1).ok_or("voice file?")?)?;

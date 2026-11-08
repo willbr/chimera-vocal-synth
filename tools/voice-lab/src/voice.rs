@@ -1276,6 +1276,49 @@ pub fn ladder(takes: &[Take], voice_path: &str, out_dir: &str) -> Result<(), Str
     Ok(())
 }
 
+/// A table of every sound in each take: when the speaker said it, and when the synth would.
+pub fn pacing(takes: &[Take], voice_path: &str, out: &str) -> Result<(), String> {
+    let g2p = pipeline::load_g2p()?;
+    let loaded = load(voice_path)?;
+    let character = Character::presets().remove(0);
+    let work = format!("{out}.work");
+    std::fs::create_dir_all(&work).map_err(|e| format!("{work}: {e}"))?;
+    let times = mfa_align(&g2p, takes, &work)?;
+    let _ = std::fs::remove_dir_all(&work);
+    let silence = loaded.phones.get(SILENCE).copied();
+    let mut table = String::from("take\tphone\tkind\tstress\tword\tword_text\trec_start\trec_end\tsynth_start\tsynth_end\n");
+    let (mut written, mut skipped) = (0, 0);
+    for (t, (take, found)) in takes.iter().zip(&times).enumerate() {
+        let Ok(found) = found else {
+            skipped += 1;
+            continue;
+        };
+        let (events, marks) = events_for(&g2p, &loaded, &take.text, &character)?;
+        let phrases = crate::british::southern_british(&g2p, &g2p.to_phrases(&take.text), "male", 112.0, true)?;
+        let segments = plan(&inputs(&phrases), "male", 112.0).segments;
+        if events.iter().filter(|e| Some(e.phone) != silence).count() != found.len() || segments.len() != found.len() {
+            skipped += 1;
+            continue;
+        }
+        let (mut clock, mut k) = (0u32, 0usize);
+        for (e, event) in events.iter().enumerate() {
+            if Some(event.phone) != silence {
+                let (phone, start, end, _) = &found[k];
+                let word = marks.iter().position(|m| m.1 <= e && e <= m.2).unwrap_or(0);
+                let s = &segments[k];
+                let at = |n: u32| n as f64 / FS_OUT;
+                table.push_str(&format!("{t}\t{phone}\t{}\t{}\t{word}\t{}\t{start:.3}\t{end:.3}\t{:.3}\t{:.3}\n", s.kind, s.stress.unwrap_or(0), marks[word].0, at(clock), at(clock + event.samples)));
+                k += 1;
+            }
+            clock += event.samples;
+        }
+        written += 1;
+    }
+    std::fs::write(out, table).map_err(|e| format!("{out}: {e}"))?;
+    println!("{written} takes compared, {skipped} skipped");
+    Ok(())
+}
+
 // ---- choosing what to read
 
 /// Greedy selection from Arctic-format lines: most new joins per sound.
