@@ -16,6 +16,9 @@ const HOP: usize = 160; // 10 ms at 16 kHz
 const WINDOW: usize = 400;
 const PRE: f64 = 0.95;
 const SILENCE: &str = "#";
+/// The shortest a vowel in a small word mid-phrase may be, in seconds.
+const SMALL_SCHWA_FLOOR: f64 = 0.055;
+const SMALL_VOWEL_FLOOR: f64 = 0.07;
 const FS_OUT: f64 = OUT_RATE as f64;
 /// Longest stretch of frames one join may keep, so a bad alignment can't store seconds of audio.
 const MAX_JOIN_FRAMES: usize = 60;
@@ -342,6 +345,108 @@ fn phone_labels(phrases: &[chimera::phonetics::english::Phrase], planned: &chime
 struct Planned {
     words: Vec<Vec<Unit>>,
     segments: Vec<(String, f64, usize)>,
+    /// each segment's timing context
+    classes: Vec<u8>,
+    /// the pause the planner wants after each phrase
+    pauses: Vec<f64>,
+}
+
+/// Contexts a sound's length is learned in: small word, unstressed or stressed syllable of a
+/// content word, then the same three again at the end of a phrase.
+const TIMING_CLASSES: usize = 6;
+
+const SMALL_WORDS: [&str; 62] = [
+    "the", "a", "an", "of", "to", "and", "in", "on", "at", "for", "or", "nor", "but", "is", "was", "were", "be", "been", "am", "are", "it", "its", "he", "she", "her", "his", "him", "they", "them", "their", "we",
+    "us", "you", "your", "i", "my", "me", "that", "this", "as", "with", "by", "from", "had", "has", "have", "do", "did", "so", "not", "if", "would", "could", "should", "will", "can", "shall", "than", "i'm", "it's", "you're", "he's",
+];
+
+/// The timing context of every planned segment.
+fn timing_classes(phrases: &[chimera::phonetics::english::Phrase], planned: &chimera::phonetics::Plan, spans: &[pipeline::SegSpan]) -> Vec<u8> {
+    let said: Vec<&str> = phrases.iter().flat_map(|p| p.words.iter().map(String::as_str)).collect();
+    let is_vowel = |k: usize| planned.segments[k].kind == "vowel";
+    // a two-part vowel may carry its stress on either part
+    let stressed = |v: usize| spans.iter().find(|s| s.first <= v && v < s.first + s.count).is_some_and(|s| (s.first..s.first + s.count).any(|k| planned.segments[k].stress.unwrap_or(0) >= 1));
+    let mut classes = vec![0u8; planned.segments.len()];
+    for span in spans {
+        let word = || spans.iter().filter(|s| s.word == span.word);
+        let start = word().map(|s| s.first).min().unwrap_or(span.first);
+        let end = word().map(|s| s.first + s.count).max().unwrap_or(span.first + span.count);
+        let last_vowel = spans.iter().filter(|s| s.phrase == span.phrase && (s.first..s.first + s.count).any(is_vowel)).map(|s| s.first).max();
+        let small = said.get(span.word).is_some_and(|w| SMALL_WORDS.contains(&w.to_lowercase().as_str()));
+        for k in span.first..span.first + span.count {
+            // a consonant belongs with the vowel after it, or failing that the one before
+            let vowel = (k..end).find(|&v| is_vowel(v)).or_else(|| (start..k).rev().find(|&v| is_vowel(v)));
+            let base = if small {
+                0
+            } else if vowel.is_some_and(stressed) {
+                2
+            } else {
+                1
+            };
+            classes[k] = base + if last_vowel.is_some_and(|f| k >= f) { 3 } else { 0 };
+        }
+    }
+    classes
+}
+
+/// One recorded sound, for learning how long each sound is held.
+struct TimingSample {
+    phone: usize,
+    class: usize,
+    planned: f64,
+    recorded: f64,
+}
+
+/// A table of Q6 length scales by phone and context. A context seen rarely leans on what the
+/// sound usually does and what that context usually does to any sound. The total is kept to the
+/// speaker's overall speed.
+fn fit_timing(samples: &[TimingSample], phones: usize) -> Vec<u8> {
+    const LEAN: f64 = 4.0;
+    let log = |s: &TimingSample| (s.recorded.max(0.01) / s.planned).ln();
+    let mut phone = vec![(0.0f64, 0usize); phones];
+    for s in samples {
+        phone[s.phone].0 += log(s);
+        phone[s.phone].1 += 1;
+    }
+    let phone_mean: Vec<f64> = phone.iter().map(|(sum, n)| sum / (*n).max(1) as f64).collect();
+    let mut class = [(0.0f64, 0usize); TIMING_CLASSES];
+    for s in samples {
+        class[s.class].0 += log(s) - phone_mean[s.phone];
+        class[s.class].1 += 1;
+    }
+    let mut cell = vec![(0.0f64, 0usize); phones * TIMING_CLASSES];
+    for s in samples {
+        let c = &mut cell[s.phone * TIMING_CLASSES + s.class];
+        c.0 += log(s);
+        c.1 += 1;
+    }
+    let mut logs = vec![0.0f64; phones * TIMING_CLASSES];
+    for p in 0..phones {
+        for c in 0..TIMING_CLASSES {
+            let prior = phone_mean[p] + class[c].0 / class[c].1.max(1) as f64;
+            let (sum, n) = cell[p * TIMING_CLASSES + c];
+            logs[p * TIMING_CLASSES + c] = (sum + LEAN * prior) / (n as f64 + LEAN);
+        }
+    }
+    let recorded: f64 = samples.iter().map(|s| s.recorded.max(0.01)).sum();
+    let predicted: f64 = samples.iter().map(|s| s.planned * logs[s.phone * TIMING_CLASSES + s.class].exp()).sum();
+    let speed = if predicted > 0.0 { (recorded / predicted).ln() } else { 0.0 };
+    logs.iter().map(|l| ((l + speed).exp() * 64.0).round().clamp(13.0, 255.0) as u8).collect()
+}
+
+/// Which pause a phrase ends in: 0 for a comma's, 1 for a full stop's.
+fn pause_kind(planned: f64) -> usize {
+    usize::from(planned >= 0.25)
+}
+
+/// The timing table at the end of a voice file, if it has one.
+fn read_timing(b: &[u8], phones: usize) -> (Vec<u8>, [u8; 2]) {
+    let size = phones * TIMING_CLASSES + 2 + 4;
+    if b.len() < size || &b[b.len() - 4..] != b"TIME" {
+        return (Vec::new(), [0, 0]);
+    }
+    let t = &b[b.len() - size..b.len() - 4];
+    (t[..phones * TIMING_CLASSES].to_vec(), [t[phones * TIMING_CLASSES], t[phones * TIMING_CLASSES + 1]])
 }
 
 /// The sounds of a take in the order our own front end would say them, grouped by word.
@@ -355,6 +460,8 @@ fn plan_take(g2p: &EnglishG2P, text: &str) -> Result<Planned, String> {
     let spans = seg_spans(&phrases, &planned.segments)?;
     let labels = phone_labels(&phrases, &planned, &spans);
     let segments = spans.iter().flat_map(|sp| (sp.first..sp.first + sp.count).map(|k| (labels[k].clone(), planned.segments[k].t1 - planned.segments[k].t0, sp.phrase))).collect();
+    let classes = timing_classes(&phrases, &planned, &spans);
+    let pauses = phrases.iter().map(|p| p.pause).collect();
     let word_count = spans.last().map_or(0, |s| s.word + 1);
     let mut words = Vec::with_capacity(word_count);
     for w in 0..word_count {
@@ -378,7 +485,7 @@ fn plan_take(g2p: &EnglishG2P, text: &str) -> Result<Planned, String> {
             words.push(units);
         }
     }
-    Ok(Planned { words, segments })
+    Ok(Planned { words, segments, classes, pauses })
 }
 
 fn write_16k(path: &str, x: &[f32]) -> Result<(), String> {
@@ -748,12 +855,20 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
     }
 
     let mut ratios: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut timing_samples = Vec::new();
+    let mut gaps: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
     for (take, found) in takes.iter().zip(&times) {
         let (Ok(found), Ok(planned)) = (found, plan_take(&g2p, &take.text)) else { continue };
         if found.len() == planned.segments.len() {
-            for (t, s) in found.iter().zip(&planned.segments) {
+            for (i, (t, s)) in found.iter().zip(&planned.segments).enumerate() {
                 if s.1 > 0.0 {
                     ratios.entry(t.0.as_str()).or_default().push((t.2 - t.1) / s.1);
+                    timing_samples.push(TimingSample { phone: id[&t.0] as usize, class: planned.classes[i] as usize, planned: s.1, recorded: t.2 - t.1 });
+                }
+                if let Some(next) = found.get(i + 1) {
+                    if planned.segments[i + 1].2 != s.2 {
+                        gaps[pause_kind(planned.pauses[s.2])].push(next.1 - t.2);
+                    }
                 }
             }
         }
@@ -768,7 +883,18 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
             None => 64,
         })
         .collect();
-    let file = voice_file(&phones, &scales, &pulse, &index, &frames_bytes);
+    let timing = fit_timing(&timing_samples, phones.len());
+    let pauses = gaps.map(|mut g| {
+        if g.len() < 5 {
+            return 0u8; // too few to trust: the planner's pause stands
+        }
+        g.sort_by(f64::total_cmp);
+        (g[g.len() / 2] / 0.004).round().clamp(1.0, 255.0) as u8
+    });
+    let mut file = voice_file(&phones, &scales, &pulse, &index, &frames_bytes);
+    file.extend_from_slice(&timing);
+    file.extend_from_slice(&pauses);
+    file.extend_from_slice(b"TIME");
     if let Some(dir) = std::path::Path::new(out_path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -810,6 +936,10 @@ pub struct LoadedVoice {
     pub pulse: Vec<i16>,
     /// how long this speaker holds each phone against the planner, Q6
     pub scales: Vec<u8>,
+    /// the same by context, TIMING_CLASSES per phone; empty in an older voice
+    timing: Vec<u8>,
+    /// the speaker's pause after a comma and a full stop in 4 ms units; 0 keeps the planner's
+    pauses: [u8; 2],
     pub joins: HashSet<(u8, u8)>,
     pub voice: Voice,
     pub phones: HashMap<String, u8>,
@@ -819,6 +949,20 @@ pub struct LoadedVoice {
 impl LoadedVoice {
     fn scale(&self, phone: u8) -> f64 {
         self.scales[phone as usize] as f64 / 64.0
+    }
+
+    fn timing(&self, phone: u8, class: u8) -> f64 {
+        match self.timing.get(phone as usize * TIMING_CLASSES + class as usize) {
+            Some(&q) => q as f64 / 64.0,
+            None => self.scale(phone),
+        }
+    }
+
+    fn pause(&self, planned: f64) -> f64 {
+        match self.pauses[pause_kind(planned)] {
+            0 => planned,
+            q => q as f64 * 0.004,
+        }
     }
 }
 
@@ -850,8 +994,9 @@ pub fn load(path: &str) -> Result<LoadedVoice, String> {
     let join_count = u16::from_le_bytes([head[0], head[1]]) as usize;
     let table = b.get(index_at + 2..index_at + 2 + join_count * 10).ok_or_else(bad)?;
     let joins = table.chunks(10).map(|e| (e[0], e[1])).collect();
+    let (timing, pauses) = read_timing(&b, n);
     let voice = Voice::from_bytes(b).ok_or_else(bad)?;
-    Ok(LoadedVoice { pulse, scales, joins, voice, phones, rom_bytes })
+    Ok(LoadedVoice { pulse, scales, timing, pauses, joins, voice, phones, rom_bytes })
 }
 
 /// A character: all the tweakable settings.
@@ -945,6 +1090,7 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
     let planned = plan(&inputs(&phrases), "male", 112.0);
     let spans = seg_spans(&phrases, &planned.segments)?;
     let labels = phone_labels(&phrases, &planned, &spans);
+    let classes = timing_classes(&phrases, &planned, &spans);
     let phone_id = |ipa: &str| -> Option<u8> { voice.phones.get(ipa).copied() };
     let silence = phone_id(SILENCE).ok_or("the voice has no silence")?;
     let schwa = phone_id("ə").unwrap_or(silence);
@@ -976,10 +1122,14 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
                 let phone = phone_id(&labels[k]).or_else(|| phone_id(&s.ipa)).unwrap_or(schwa);
                 // the speaker's median shortens every example of a vowel, but "do" and "you" still need saying
                 let single = in_phrase.iter().filter(|x| x.word == span.word).flat_map(|x| x.first..x.first + x.count).filter(|&v| planned.segments[v].kind == "vowel").count() == 1;
+                // small words mid-phrase really are short; these keep them from vanishing
+                let small = classes[k] == 0;
                 let floor = match labels[k].as_str() {
+                    "ə" if small => SMALL_SCHWA_FLOOR,
                     // a word with no other vowel ("or", "her", "of") collapses without this
                     "ə" if single => 0.07,
                     "ə" => 0.055,
+                    "i" | "ɪ" | "ɛ" | "æ" | "ɑ" | "ɒ" | "ɔ" | "ʊ" | "u" | "ʌ" | "ɐ" if small => SMALL_VOWEL_FLOOR,
                     "i" | "ɪ" | "ɛ" | "æ" | "ɑ" | "ɒ" | "ɔ" | "ʊ" | "u" | "ʌ" | "ɐ" => 0.08,
                     _ => 0.0,
                 };
@@ -987,11 +1137,12 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
                     let first = mark.map_or(events.len(), |m| m.0);
                     *mark = Some((first, events.len()));
                 }
-                events.push(Event { phone, samples: to_samples(((s.t1 - s.t0) * voice.scale(phone)).max(floor)), f0: hz(f) });
+                events.push(Event { phone, samples: to_samples(((s.t1 - s.t0) * voice.timing(phone, classes[k])).max(floor)), f0: hz(f) });
                 done += 1;
             }
         }
-        events.push(Event { phone: silence, samples: to_samples(phrase.pause.max(0.1)), f0: hz(c.pitch * 0.9) });
+        let pause = if pi + 1 < phrases.len() { voice.pause(phrase.pause) } else { phrase.pause };
+        events.push(Event { phone: silence, samples: to_samples(pause.max(0.1)), f0: hz(c.pitch * 0.9) });
     }
     let marks = said.into_iter().zip(marks).filter_map(|(w, m)| m.map(|(a, b)| (w, a, b))).collect();
     Ok((events, marks))
@@ -1267,7 +1418,8 @@ pub fn ladder(takes: &[Take], voice_path: &str, out_dir: &str) -> Result<(), Str
         write_wav(&wav(stages[0]), &recordings[i])?;
         write_wav(&wav(stages[1]), &to_float_at_fs(&copy_synth(&an, &loaded.pulse, &params)?))?;
         write_wav(&wav(stages[2]), &to_float_at_fs(&own_cuts(&an, &times, None, &loaded.pulse, &params)?))?;
-        let planned: Vec<f64> = plan_take(&g2p, &take.text)?.segments.iter().map(|s| s.1 * loaded.phones.get(&s.0).map_or(1.0, |&p| loaded.scale(p))).collect();
+        let in_plan = plan_take(&g2p, &take.text)?;
+        let planned: Vec<f64> = in_plan.segments.iter().zip(&in_plan.classes).map(|(s, &c)| s.1 * loaded.phones.get(&s.0).map_or(1.0, |&p| loaded.timing(p, c))).collect();
         write_wav(&wav(stages[3]), &to_float_at_fs(&own_cuts(&an, &times, Some(&planned), &loaded.pulse, &params)?))?;
         write_wav(&wav(stages[4]), &to_float_at_fs(&joins_with_own_prosody(&loaded, &times, &an, &params)?))?;
         write_wav(&wav(stages[5]), &to_float_at_fs(&speak(&g2p, &loaded, &take.text, &character)?.samples))?;
@@ -1358,4 +1510,36 @@ pub fn select_prompts(pool_path: &str, out_path: &str, count: usize) -> Result<(
     std::fs::write(out_path, chosen.join("\n") + "\n").map_err(|e| format!("{out_path}: {e}"))?;
     println!("chose {} sentences covering {} of {} joins seen in the pool", chosen.len(), seen.len(), total.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TIMING_CLASSES, TimingSample, fit_timing, read_timing};
+
+    fn samples(phone: usize, class: usize, n: usize, ratio: f64) -> Vec<TimingSample> {
+        (0..n).map(|_| TimingSample { phone, class, planned: 0.1, recorded: 0.1 * ratio }).collect()
+    }
+
+    #[test]
+    fn a_context_heard_once_leans_on_what_is_usual_and_the_total_speed_holds() {
+        let mut all = samples(0, 0, 20, 1.0);
+        all.extend(samples(1, 2, 20, 2.0));
+        all.extend(samples(0, 2, 1, 8.0)); // one odd recording must not set this sound's length
+        let table = fit_timing(&all, 2);
+        let at = |p: usize, c: usize| table[p * TIMING_CLASSES + c] as f64 / 64.0;
+        assert!(at(0, 2) > 1.2 && at(0, 2) < 3.0, "{}", at(0, 2));
+        assert!((at(1, 2) - 2.0).abs() < 0.3, "{}", at(1, 2));
+        let (recorded, predicted): (f64, f64) = all.iter().map(|s| (s.recorded, s.planned * at(s.phone, s.class))).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+        assert!((predicted / recorded - 1.0).abs() < 0.03, "{predicted} {recorded}");
+    }
+
+    #[test]
+    fn an_older_voice_has_no_timing_table() {
+        // a voice's last byte is a frame's voicing, at most 15, so it can't end in the marker
+        assert_eq!(read_timing(&[0, 0, 0, 15], 1), (Vec::new(), [0, 0]));
+        let mut b = vec![1u8; TIMING_CLASSES];
+        b.extend_from_slice(&[7, 9]);
+        b.extend_from_slice(b"TIME");
+        assert_eq!(read_timing(&b, 1), (vec![1u8; TIMING_CLASSES], [7, 9]));
+    }
 }
