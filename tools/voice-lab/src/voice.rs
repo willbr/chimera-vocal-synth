@@ -669,7 +669,12 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
     }
     let single_example_joins = groups.values().filter(|g| g.len() == 1).count();
     let mut best: BTreeMap<(u8, u8), (f64, Candidate)> = BTreeMap::new();
-    for ((a, b), group) in groups {
+    for ((a, b), mut group) in groups {
+        // a side only one frame long has no transition left to play ("would" lost its d)
+        let whole = |c: &Candidate| c.join >= 2 && c.frames.len() - c.join >= 2;
+        if group.iter().any(whole) {
+            group.retain(whole);
+        }
         let shapes: Vec<Vec<f64>> = group.iter().map(shape).collect();
         let typical: Vec<f64> = (0..shapes[0].len())
             .map(|d| {
@@ -697,8 +702,10 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
         index.push(Entry { a: *a, b: *b, offset: (frames_bytes.len() / FRAME_BYTES) as u32, frames: c.frames.len() as u16, join: c.join as u16 });
         // a piece from the end of a sentence is much quieter than one from the middle: bring each
         // end to its sound's usual level, ramping across the piece so its own shape survives
-        let left = (usual_gain[a] - c.frames[0].gain as f64).clamp(-48.0, 48.0);
-        let right = (usual_gain[b] - c.frames[c.frames.len() - 1].gain as f64).clamp(-48.0, 48.0);
+        // next to silence a piece keeps its own level: speech really does fade at the end of a phrase
+        let silence = id[SILENCE];
+        let left = if *b == silence { 0.0 } else { (usual_gain[a] - c.frames[0].gain as f64).clamp(-48.0, 48.0) };
+        let right = if *a == silence { 0.0 } else { (usual_gain[b] - c.frames[c.frames.len() - 1].gain as f64).clamp(-48.0, 48.0) };
         let last = (c.frames.len() - 1).max(1) as f64;
         for (i, f) in c.frames.iter().enumerate() {
             let t = i as f64 / last;
