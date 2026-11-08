@@ -144,6 +144,7 @@ struct App {
     note_text: String,
     notes: Vec<voice::Note>,
     spoken_text: String,
+    show_fixed: bool,
 }
 
 /// Alice's Adventures in Wonderland (1865, public domain), one sentence per line.
@@ -198,6 +199,7 @@ impl App {
             note_text: String::new(),
             notes: std::fs::read_to_string(notes_path()).map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default(),
             spoken_text: String::new(),
+            show_fixed: false,
         };
         app.prompts = std::fs::read_to_string(repo_path("out/voice-lab/prompts.txt")).map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect()).unwrap_or_default();
         app.prompts.extend(include_str!("../books/alice-prompts.txt").lines().map(str::to_string));
@@ -475,10 +477,10 @@ impl App {
 
     /// Exactly the sound the sentence used for this word, with a short fade so the cut doesn't click.
     fn play_words(&mut self, first: usize, last: usize) {
-        let (start, end) = ((self.spoken_words[first].start - 0.02).max(0.0), self.spoken_words[last].end + 0.03);
+        let (start, end) = (self.spoken_words[first].start, self.spoken_words[last].end + 0.01);
         let to_sample = |t: f64| ((t * pipeline::FS) as usize).min(self.spoken_audio.len());
         let mut x = self.spoken_audio[to_sample(start)..to_sample(end)].to_vec();
-        let fade = (0.01 * pipeline::FS) as usize;
+        let fade = (0.005 * pipeline::FS) as usize;
         let n = x.len();
         for k in 0..fade.min(n / 2) {
             let g = k as f32 / fade as f32;
@@ -499,6 +501,24 @@ impl App {
         }
     }
 
+    /// For each word of the sentence on screen, the open note on it, if there is one. A note is
+    /// found by its words, then by the closest time, because timing moves as voices change.
+    fn noted_words(&self) -> Vec<Option<String>> {
+        let mut out = vec![None; self.spoken_words.len()];
+        for n in self.notes.iter().filter(|n| !n.fixed && n.sentence == self.spoken_text) {
+            let wanted: Vec<&str> = n.words.split(' ').collect();
+            let starts = 0..self.spoken_words.len().saturating_sub(wanted.len() - 1);
+            let matches = starts.filter(|&i| wanted.iter().enumerate().all(|(k, w)| self.spoken_words[i + k].text == *w));
+            let distance = |i: usize| (self.spoken_words[i].start - n.start).abs();
+            if let Some(i) = matches.min_by(|&a, &b| distance(a).total_cmp(&distance(b))) {
+                for k in 0..wanted.len() {
+                    out[i + k] = Some(n.note.clone());
+                }
+            }
+        }
+        out
+    }
+
     fn save_note(&mut self, a: usize, b: usize) {
         let words: Vec<&str> = self.spoken_words[a..=b].iter().map(|w| w.text.as_str()).collect();
         let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -510,6 +530,7 @@ impl App {
             start: self.spoken_words[a].start,
             end: self.spoken_words[b].end,
             when,
+            fixed: false,
         });
         self.note_text.clear();
         self.save_notes();
@@ -579,6 +600,7 @@ impl App {
                 }
                 let mut clicked = None;
                 let selection = self.selection;
+                let noted = self.noted_words();
                 ui.horizontal_wrapped(|ui| {
                     for (i, w) in self.spoken_words.iter().enumerate() {
                         let mut text = egui::RichText::new(&w.text).size(22.0);
@@ -586,14 +608,19 @@ impl App {
                             text = text.background_color(egui::Color32::from_rgb(255, 214, 90)).color(egui::Color32::BLACK);
                         } else if selection.is_some_and(|(a, b)| i >= a && i <= b) {
                             text = text.background_color(egui::Color32::from_rgb(170, 205, 255)).color(egui::Color32::BLACK);
+                        } else if noted[i].is_some() {
+                            text = text.background_color(egui::Color32::from_rgb(255, 190, 190)).color(egui::Color32::BLACK);
                         }
-                        let label = ui.add(egui::Label::new(text).sense(egui::Sense::click()).selectable(false));
-                        if label.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        let mut label = ui.add(egui::Label::new(text).sense(egui::Sense::click()).selectable(false)).on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if let Some(note) = &noted[i] {
+                            label = label.on_hover_text(note);
+                        }
+                        if label.clicked() {
                             clicked = Some(i);
                         }
                     }
                 });
-                ui.weak("Click a word to hear it. Shift-click another to take the whole stretch.");
+                ui.weak("Click a word to hear it. Shift-click another to take the whole stretch. Pink words have an open note.");
                 if let Some(i) = clicked {
                     let shift = ui.input(|k| k.modifiers.shift);
                     let (a, b) = match self.selection {
@@ -660,16 +687,29 @@ impl App {
             }
             if !self.notes.is_empty() {
                 ui.add_space(10.0);
-                let (mut go_to, mut remove) = (None, None);
-                egui::CollapsingHeader::new(format!("Notes ({})", self.notes.len())).default_open(true).show(ui, |ui| {
+                let (mut go_to, mut remove, mut toggle) = (None, None, None);
+                let open = self.notes.iter().filter(|n| !n.fixed).count();
+                let fixed = self.notes.len() - open;
+                egui::CollapsingHeader::new(format!("Notes ({open} open, {fixed} fixed)")).id_salt("notes").default_open(true).show(ui, |ui| {
+                    ui.checkbox(&mut self.show_fixed, "Show fixed");
                     egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
                         for (i, n) in self.notes.iter().enumerate() {
+                            if n.fixed && !self.show_fixed {
+                                continue;
+                            }
                             ui.horizontal_wrapped(|ui| {
-                                ui.strong(&n.words);
+                                if n.fixed {
+                                    ui.label(egui::RichText::new(&n.words).strikethrough().weak());
+                                } else {
+                                    ui.strong(&n.words);
+                                }
                                 ui.label(&n.note);
                                 ui.weak(&n.sentence);
                                 if ui.small_button("Go to").clicked() {
                                     go_to = Some(i);
+                                }
+                                if ui.small_button(if n.fixed { "Reopen" } else { "Fixed" }).clicked() {
+                                    toggle = Some(i);
                                 }
                                 if ui.small_button("Delete").clicked() {
                                     remove = Some(i);
@@ -678,6 +718,10 @@ impl App {
                         }
                     });
                 });
+                if let Some(i) = toggle {
+                    self.notes[i].fixed = !self.notes[i].fixed;
+                    self.save_notes();
+                }
                 if let Some(i) = go_to {
                     self.say_text = self.notes[i].sentence.clone();
                     speak_now = true;

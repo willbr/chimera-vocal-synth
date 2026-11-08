@@ -853,6 +853,8 @@ pub struct Note {
     pub start: f64,
     pub end: f64,
     pub when: u64,
+    #[serde(default)]
+    pub fixed: bool,
 }
 
 /// Each spoken word: the front end's text for it, and its first and last event.
