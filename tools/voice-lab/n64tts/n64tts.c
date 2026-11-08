@@ -41,7 +41,7 @@ int n64tts_voice_init(n64tts_voice *v, const unsigned char *data, unsigned int l
     for (i = 0; i < phones; i++) {
         if (at >= length)
             return -1;
-        at += 1u + data[at];
+        at += 2u + data[at]; /* length, name, duration scale */
     }
     if (at + 257u * 2u + 128u * 2u + 2u > length)
         return -1;

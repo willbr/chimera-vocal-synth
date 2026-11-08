@@ -93,7 +93,7 @@ mod tests {
 
     /// Two sounds, with joins 0→1 and 1→0 only, four frames each.
     fn tiny_voice() -> Voice {
-        let mut b = b"CVOX\x02\x01a\x01b".to_vec();
+        let mut b = b"CVOX\x02\x01a\x40\x01b\x40".to_vec();
         for k in 0..=256 {
             let c = (std::f64::consts::PI * k as f64 / 256.0).cos() * 32767.0;
             b.extend_from_slice(&(c.round() as i16).to_le_bytes());

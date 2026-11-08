@@ -631,7 +631,28 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
         }
     }
 
-    let file = voice_file(&phones, &pulse, &index, &frames_bytes);
+    let mut ratios: HashMap<&str, Vec<f64>> = HashMap::new();
+    for (take, found) in takes.iter().zip(&times) {
+        let (Ok(found), Ok(planned)) = (found, plan_take(&g2p, &take.text)) else { continue };
+        if found.len() == planned.segments.len() {
+            for (t, s) in found.iter().zip(&planned.segments) {
+                if s.1 > 0.0 {
+                    ratios.entry(t.0.as_str()).or_default().push((t.2 - t.1) / s.1);
+                }
+            }
+        }
+    }
+    let scales: Vec<u8> = phones
+        .iter()
+        .map(|p| match ratios.get_mut(p.as_str()) {
+            Some(r) => {
+                r.sort_by(f64::total_cmp);
+                (r[r.len() / 2] * 64.0).round().clamp(32.0, 128.0) as u8
+            }
+            None => 64,
+        })
+        .collect();
+    let file = voice_file(&phones, &scales, &pulse, &index, &frames_bytes);
     if let Some(dir) = std::path::Path::new(out_path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -639,13 +660,14 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
     Ok(BuildReport { takes: takes.len() - failed, phones: phones.len(), joins: index.len(), frames: frames_bytes.len() / FRAME_BYTES, rom_bytes: file.len(), failed, single_example_joins })
 }
 
-fn voice_file(phones: &[String], pulse: &[i16], index: &[Entry], frames_bytes: &[u8]) -> Vec<u8> {
+fn voice_file(phones: &[String], scales: &[u8], pulse: &[i16], index: &[Entry], frames_bytes: &[u8]) -> Vec<u8> {
     let mut file = Vec::new();
     file.extend_from_slice(b"CVOX");
     file.push(phones.len() as u8);
-    for p in phones {
+    for (p, scale) in phones.iter().zip(scales) {
         file.push(p.len() as u8);
         file.extend_from_slice(p.as_bytes());
+        file.push(*scale);
     }
     for k in 0..=256 {
         let c = (PI * k as f64 / 256.0).cos() * 32767.0;
@@ -670,9 +692,17 @@ fn voice_file(phones: &[String], pulse: &[i16], index: &[Entry], frames_bytes: &
 
 pub struct LoadedVoice {
     pub pulse: Vec<i16>,
+    /// how long this speaker holds each phone against the planner, Q6
+    pub scales: Vec<u8>,
     pub voice: Voice,
     pub phones: HashMap<String, u8>,
     pub rom_bytes: usize,
+}
+
+impl LoadedVoice {
+    fn scale(&self, phone: u8) -> f64 {
+        self.scales[phone as usize] as f64 / 64.0
+    }
 }
 
 pub fn load(path: &str) -> Result<LoadedVoice, String> {
@@ -685,18 +715,21 @@ pub fn load(path: &str) -> Result<LoadedVoice, String> {
     let n = *b.get(at).ok_or_else(bad)? as usize;
     at += 1;
     let mut phones = HashMap::new();
+    let mut scales = Vec::with_capacity(n);
     for i in 0..n {
         let len = *b.get(at).ok_or_else(bad)? as usize;
         at += 1;
         let name = std::str::from_utf8(b.get(at..at + len).ok_or_else(bad)?).map_err(|_| bad())?;
         phones.insert(name.to_string(), i as u8);
         at += len;
+        scales.push(*b.get(at).ok_or_else(bad)?);
+        at += 1;
     }
     let rom_bytes = b.len();
     let pulse_at = at + 257 * 2;
     let pulse = b.get(pulse_at..pulse_at + PULSE_LEN * 2).ok_or_else(bad)?.chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
     let voice = Voice::from_bytes(b).ok_or_else(bad)?;
-    Ok(LoadedVoice { pulse, voice, phones, rom_bytes })
+    Ok(LoadedVoice { pulse, scales, voice, phones, rom_bytes })
 }
 
 /// A character: all the tweakable settings.
@@ -773,7 +806,8 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
                         Intonation::Flat => {}
                     }
                 }
-                events.push(Event { phone: phone_id(&s.ipa).unwrap_or(schwa), samples: to_samples(s.t1 - s.t0), f0: hz(f) });
+                let phone = phone_id(&s.ipa).unwrap_or(schwa);
+                events.push(Event { phone, samples: to_samples((s.t1 - s.t0) * voice.scale(phone)), f0: hz(f) });
                 done += 1;
             }
         }
@@ -840,7 +874,7 @@ fn copy_synth(an: &Analysis, pulse: &[i16], params: &Params) -> Result<Vec<i16>,
         bytes.push(f.gain);
         bytes.push(f.voiced);
     }
-    let voice = Voice::from_bytes(voice_file(&names, pulse, &index, &bytes)).ok_or("bad copy voice")?;
+    let voice = Voice::from_bytes(voice_file(&names, &vec![64; names.len()], pulse, &index, &bytes)).ok_or("bad copy voice")?;
     let events: Vec<Event> = (0..n).map(|i| Event { phone: i as u8, samples: (CHUNK * HOP) as u32, f0: q4(pitch[i * CHUNK + CHUNK / 2]) }).collect();
     let mut out = vec![0i16; n64::output_len(&events)];
     n64::render(&voice, &events, params, &mut out);
@@ -907,7 +941,7 @@ fn own_cuts(an: &Analysis, times: &[(String, f64, f64, usize)], durations: Optio
         bytes.push(f.voiced);
     }
     let names = vec![String::new(); items.len()];
-    let voice = Voice::from_bytes(voice_file(&names, pulse, &index, &bytes)).ok_or("bad one-off voice")?;
+    let voice = Voice::from_bytes(voice_file(&names, &vec![64; names.len()], pulse, &index, &bytes)).ok_or("bad one-off voice")?;
     let mut events = Vec::with_capacity(items.len());
     for (k, item) in items.iter().enumerate() {
         let (samples, f0) = match *item {
@@ -957,7 +991,7 @@ pub fn ladder(takes: &[Take], voice_path: &str, out_dir: &str) -> Result<(), Str
         write_wav(&wav(stages[0]), &recordings[i])?;
         write_wav(&wav(stages[1]), &to_float_at_fs(&copy_synth(&an, &loaded.pulse, &params)?))?;
         write_wav(&wav(stages[2]), &to_float_at_fs(&own_cuts(&an, &times, None, &loaded.pulse, &params)?))?;
-        let planned: Vec<f64> = plan_take(&g2p, &take.text)?.segments.iter().map(|s| s.1).collect();
+        let planned: Vec<f64> = plan_take(&g2p, &take.text)?.segments.iter().map(|s| s.1 * loaded.phones.get(&s.0).map_or(1.0, |&p| loaded.scale(p))).collect();
         write_wav(&wav(stages[3]), &to_float_at_fs(&own_cuts(&an, &times, Some(&planned), &loaded.pulse, &params)?))?;
         write_wav(&wav(stages[4]), &to_float_at_fs(&joins_with_own_prosody(&loaded, &times, &an, &params)?))?;
         write_wav(&wav(stages[5]), &to_float_at_fs(&speak(&g2p, &loaded, &take.text, &character)?.samples))?;
