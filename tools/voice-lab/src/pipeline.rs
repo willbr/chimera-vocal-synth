@@ -109,7 +109,7 @@ pub(crate) fn plan(inputs: &[PhraseInput], body: &str, f0: f64) -> Plan {
     plan_phrases(inputs, &PlanOptions { body: mix, t0: 0.05, f0: Some(f0), ..Default::default() })
 }
 
-fn render(plan: &Plan, body: &str, f0: f64) -> Vec<f32> {
+pub(crate) fn render_engine(plan: &Plan, body: &str, f0: f64) -> Vec<f32> {
     let mix: BodyMix = body.into();
     let mut voice = HumanVoice::new(FS, mix.body(), 2);
     voice.set_source(&SourcePatch::f0(f0));
@@ -387,7 +387,7 @@ fn interp(points: &[(f64, f64)], t: f64) -> f64 {
 }
 
 /// The warp from engine frames to recording frames, guided by (engine time, recording time) points.
-fn align(eng: &[f32], mine: &[f32], mut points: Vec<(f64, f64)>) -> Result<Vec<f64>, String> {
+pub(crate) fn align(eng: &[f32], mine: &[f32], mut points: Vec<(f64, f64)>) -> Result<Vec<f64>, String> {
     let (mine_dur, eng_dur) = (mine.len() as f64 / FS, eng.len() as f64 / FS);
     let anchored = !points.is_empty();
     if anchored {
@@ -406,7 +406,7 @@ fn align(eng: &[f32], mine: &[f32], mut points: Vec<(f64, f64)>) -> Result<Vec<f
     Ok(warp(&fe, &fm, &|t| interp(&points, t), band))
 }
 
-fn map_time(path: &[f64], t: f64) -> f64 {
+pub(crate) fn map_time(path: &[f64], t: f64) -> f64 {
     let f = (t / HOP_S).clamp(0.0, (path.len() - 1) as f64);
     let (i, frac) = (f.floor() as usize, f.fract());
     let next = path[(i + 1).min(path.len() - 1)];
@@ -422,7 +422,7 @@ pub fn self_test() -> Result<(), String> {
     for (_, ipa, word, onset) in WORDS {
         let phrases = crate::british::southern_british(&g2p, &g2p.to_phrases(word), "male", 112.0, false)?;
         let p = plan(&inputs(&phrases), "male", 112.0);
-        let audio = render(&p, "male", 112.0);
+        let audio = render_engine(&p, "male", 112.0);
         let low: Vec<f64> = resample(&audio, FS, LOW_FS).iter().map(|&v| v as f64).collect();
         let v = p.segments.iter().find(|s| s.kind == "vowel").ok_or("no vowel planned")?;
         let known = formants(&low, v.t0, v.t1);
@@ -435,7 +435,7 @@ pub fn self_test() -> Result<(), String> {
         let phrases = g2p.to_phrases(text);
         let base = inputs(&phrases);
         let eng_plan = plan(&base, "male", 112.0);
-        let eng = render(&eng_plan, "male", 112.0);
+        let eng = render_engine(&eng_plan, "male", 112.0);
         let spans = seg_spans(&phrases, &eng_plan.segments)?;
         let mut scrambled = base.clone();
         let mut seed = 12345u32;
@@ -447,7 +447,7 @@ pub fn self_test() -> Result<(), String> {
             scrambled[span.phrase].segments[span.seg].dur = Some((b - a) * scale);
         }
         let truth_plan = plan(&scrambled, "female", 190.0);
-        let truth = render(&truth_plan, "female", 190.0);
+        let truth = render_engine(&truth_plan, "female", 190.0);
         if truth_plan.segments.len() != eng_plan.segments.len() {
             return Err("scrambled plan changed the segment count".to_string());
         }
@@ -806,7 +806,7 @@ pub fn analyze(wav_path: &str, text: &str, body: &str, accent: &str, out_dir: &s
     let said: Vec<String> = phrases.iter().flat_map(|p| p.words.iter().cloned()).collect();
     let phrase_inputs = inputs(&phrases);
     let eng_plan = plan(&phrase_inputs, body, default_f0);
-    let eng = render(&eng_plan, body, default_f0);
+    let eng = render_engine(&eng_plan, body, default_f0);
     write_wav(&format!("{out_dir}/engine.wav"), &eng)?;
     let spans = seg_spans(&phrases, &eng_plan.segments)?;
 
@@ -912,7 +912,7 @@ pub fn analyze(wav_path: &str, text: &str, body: &str, accent: &str, out_dir: &s
     }
     let my_f0 = mine_pitch.median.clamp(70.0, 350.0);
     let timed_plan = plan(&timed, body, my_f0);
-    let timed_audio = render(&timed_plan, body, my_f0);
+    let timed_audio = render_engine(&timed_plan, body, my_f0);
     write_wav(&format!("{out_dir}/engine-my-timing.wav"), &timed_audio)?;
 
     let mut fit_gap = None;
@@ -922,7 +922,7 @@ pub fn analyze(wav_path: &str, text: &str, body: &str, accent: &str, out_dir: &s
         status("Rendering the engine with your fitted vowels");
         let mut fitted_plan = timed_plan.clone();
         crate::fit::apply(&mut fitted_plan, fit);
-        let fitted_audio = render(&fitted_plan, body, my_f0);
+        let fitted_audio = render_engine(&fitted_plan, body, my_f0);
         write_wav(&fitted_path, &fitted_audio)?;
         let before_low: Vec<f64> = resample(&timed_audio, FS, LOW_FS).iter().map(|&v| v as f64).collect();
         let after_low: Vec<f64> = resample(&fitted_audio, FS, LOW_FS).iter().map(|&v| v as f64).collect();

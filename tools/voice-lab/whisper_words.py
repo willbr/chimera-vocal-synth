@@ -1,4 +1,4 @@
-"""Word timings for one recording: whisper_words.py <in.wav> <out.json>
+"""Word timings for a recording: whisper_words.py <in.wav> <out.json>
 
 Run through `uv run --with faster-whisper==1.2.1`. Uses the speech judge's model (small.en, greedy)
 and its model cache, but nothing else of the judge's.
@@ -24,19 +24,21 @@ def load16k(path):
     return (np.fft.irfft(np.fft.rfft(x)[: n // 2 + 1], n) * (n / len(x))).astype(np.float32)
 
 
-wav, out = sys.argv[1:3]
+jobs = [sys.argv[1:3]]
+
 root = os.path.expanduser("~/.cache/chimera-asr/models")
 os.makedirs(root, exist_ok=True)
 model = WhisperModel("small.en", device="cpu", compute_type="int8", download_root=root)
-segments, _ = model.transcribe(
-    load16k(wav),
-    language="en",
-    beam_size=1,
-    temperature=0.0,
-    condition_on_previous_text=False,
-    vad_filter=False,
-    word_timestamps=True,
-)
-words = [{"word": w.word.strip(), "start": w.start, "end": w.end} for s in segments for w in s.words]
-with open(out, "w", encoding="utf-8") as f:
-    json.dump({"words": words}, f)
+for wav, out in jobs:
+    segments, _ = model.transcribe(
+        load16k(wav),
+        language="en",
+        beam_size=1,
+        temperature=0.0,
+        condition_on_previous_text=False,
+        vad_filter=False,
+        word_timestamps=True,
+    )
+    words = [{"word": w.word.strip(), "start": w.start, "end": w.end} for s in segments for w in s.words]
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump({"words": words}, f)

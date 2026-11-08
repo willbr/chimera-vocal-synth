@@ -11,7 +11,9 @@
 mod audio;
 mod british;
 mod fit;
+mod n64;
 mod pipeline;
+mod voice;
 
 use audio::Recording;
 use eframe::egui;
@@ -32,6 +34,20 @@ const ACCENTS: [(&str, &str); 2] = [("british", "Southern British"), ("american"
 enum Page {
     Lines,
     Vowels,
+    Read,
+    Speak,
+}
+
+fn voice_path() -> String {
+    format!("{}/voice.bin", lab_dir())
+}
+
+fn characters_path() -> String {
+    format!("{}/characters.json", lab_dir())
+}
+
+fn prompt_wav(i: usize) -> String {
+    format!("{}/read/{i:03}.wav", lab_dir())
 }
 
 fn vowels_dir() -> String {
@@ -73,6 +89,7 @@ enum Event {
     Status(String),
     Done(Result<Report, String>),
     Fitted(Result<fit::Fit, String>),
+    Built(Result<voice::BuildReport, String>),
 }
 
 struct App {
@@ -92,7 +109,24 @@ struct App {
     recording_vowel: Option<usize>,
     vowel_table: serde_json::Value,
     fit: Option<fit::Fit>,
+    prompts: Vec<String>,
+    prompt: usize,
+    prompt_done: Vec<bool>,
+    recording_prompt: Option<usize>,
+    g2p: Option<chimera::phonetics::english::EnglishG2P>,
+    loaded: Option<voice::LoadedVoice>,
+    characters: Vec<voice::Character>,
+    character: usize,
+    say_text: String,
+    speak_info: String,
+    book: Vec<&'static str>,
+    book_pos: usize,
+    read_on: bool,
+    speak_until: Option<std::time::Instant>,
 }
+
+/// Alice's Adventures in Wonderland (1865, public domain), one sentence per line.
+const BOOK: &str = include_str!("../books/alice.txt");
 
 impl App {
     fn new() -> App {
@@ -118,7 +152,24 @@ impl App {
             recording_vowel: None,
             vowel_table: pipeline::engine_vowel_table(),
             fit: fit::load(),
+            prompts: Vec::new(),
+            prompt: 0,
+            prompt_done: Vec::new(),
+            recording_prompt: None,
+            g2p: None,
+            loaded: voice::load(&voice_path()).ok(),
+            characters: std::fs::read_to_string(characters_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).filter(|c: &Vec<voice::Character>| !c.is_empty()).unwrap_or_else(voice::Character::presets),
+            character: 0,
+            say_text: "Hello there. I have been waiting for you all morning.".to_string(),
+            speak_info: String::new(),
+            book: BOOK.lines().collect(),
+            book_pos: 0,
+            read_on: false,
+            speak_until: None,
         };
+        app.prompts = std::fs::read_to_string(repo_path("out/voice-lab/prompts.txt")).map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect()).unwrap_or_default();
+        app.prompt_done = (0..app.prompts.len()).map(|i| Path::new(&prompt_wav(i)).exists()).collect();
+        app.prompt = app.prompt_done.iter().position(|d| !d).unwrap_or(0);
         app.load_report();
         app
     }
@@ -186,6 +237,285 @@ impl App {
             Ok(s) => self.player = Some(s),
             Err(e) => self.status = format!("Couldn't play: {e}"),
         }
+    }
+
+    fn takes(&self) -> Vec<voice::Take> {
+        let mut takes = Vec::new();
+        for (i, text) in self.prompts.iter().enumerate() {
+            if self.prompt_done[i] {
+                takes.push(voice::Take { wav: prompt_wav(i), text: text.clone() });
+            }
+        }
+        for line in &self.lines {
+            let wav = format!("{}/mine.wav", line_dir(line));
+            if Path::new(&wav).exists() {
+                takes.push(voice::Take { wav, text: line.clone() });
+            }
+        }
+        for (id, _, word, _) in WORDS {
+            let wav = vowel_file(id, "wav");
+            if Path::new(&wav).exists() {
+                takes.push(voice::Take { wav, text: word.to_string() });
+            }
+        }
+        takes
+    }
+
+    fn start_build(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let takes = self.takes();
+        let ctx = ctx.clone();
+        self.busy = Some(rx);
+        self.status = "Building the voice.".to_string();
+        std::thread::spawn(move || {
+            let status_tx = std::sync::Mutex::new(tx.clone());
+            let status_ctx = ctx.clone();
+            let status = move |s: &str| {
+                let _ = status_tx.lock().unwrap().send(Event::Status(s.to_string()));
+                status_ctx.request_repaint();
+            };
+            let work = format!("{}/voice-work", lab_dir());
+            let result = voice::build(&takes, &work, &voice_path(), &status);
+            let _ = std::fs::remove_dir_all(&work);
+            let _ = tx.send(Event::Built(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn toggle_prompt_recording(&mut self) {
+        if self.recording_prompt.is_some() {
+            let (Some(r), Some(i)) = (self.recording.take(), self.recording_prompt.take()) else { return };
+            let x = r.stop();
+            let peak = x.iter().fold(0f32, |p, v| p.max(v.abs()));
+            match pipeline::write_wav(&prompt_wav(i), &x) {
+                Ok(()) => {
+                    self.prompt_done[i] = true;
+                    self.status = if peak >= 0.99 {
+                        "That one clipped. Move back from the mic and record it again.".to_string()
+                    } else if peak < 0.05 {
+                        "That one was very quiet. Speak up a bit, and record it again.".to_string()
+                    } else {
+                        String::new()
+                    };
+                    // a good take moves on by itself; a bad one stays so it can be redone
+                    if self.status.is_empty() && i + 1 < self.prompts.len() {
+                        self.prompt = i + 1;
+                    }
+                }
+                Err(e) => self.status = format!("Couldn't save: {e}"),
+            }
+        } else if self.recording.is_none() && self.busy.is_none() && !self.prompts.is_empty() {
+            self.start_recording();
+            if self.recording.is_some() {
+                self.recording_prompt = Some(self.prompt);
+                self.status = "Recording. Read the sentence, then press Space.".to_string();
+            }
+        }
+    }
+
+    fn read_page(&mut self, ctx: &egui::Context) {
+        let locked = self.recording.is_some() || self.busy.is_some();
+        // not key_pressed: it counts key repeats, so a slightly long press would start and stop a take
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Space, pressed: true, repeat: false, .. }))) {
+            self.toggle_prompt_recording();
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Read");
+            if self.prompts.is_empty() {
+                ui.label("No sentences found: out/voice-lab/prompts.txt is missing.");
+                return;
+            }
+            let done = self.prompt_done.iter().filter(|d| **d).count();
+            ui.label(format!("{done} of {} sentences recorded. Press Space to start, read the sentence normally, press Space to stop. It moves on by itself.", self.prompts.len()));
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new(&self.prompts[self.prompt]).size(30.0));
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                let label = if self.recording_prompt.is_some() { "■ Stop (Space)" } else { "● Record (Space)" };
+                if ui.add_enabled(self.busy.is_none(), egui::Button::new(egui::RichText::new(label).size(20.0))).clicked() {
+                    self.toggle_prompt_recording();
+                }
+                if let Some(r) = &self.recording {
+                    ui.add(egui::ProgressBar::new(r.peak().sqrt()).desired_width(260.0).text(format!("{:.1} s", r.seconds())));
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!locked && self.prompt > 0, egui::Button::new("◀ Back")).clicked() {
+                    self.prompt -= 1;
+                    self.status.clear();
+                }
+                if ui.add_enabled(!locked && self.prompt + 1 < self.prompts.len(), egui::Button::new("Next ▶")).clicked() {
+                    self.prompt += 1;
+                    self.status.clear();
+                }
+                if ui.add_enabled(!locked && self.prompt_done[self.prompt], egui::Button::new("▶ Play this take")).clicked() {
+                    self.play_path(&prompt_wav(self.prompt));
+                }
+                ui.label(format!("Sentence {}", self.prompt + 1));
+            });
+            ui.add_space(14.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                let takes = self.takes().len();
+                if ui.add_enabled(!locked && takes > 0, egui::Button::new(egui::RichText::new("Build voice").size(18.0))).clicked() {
+                    self.start_build(ui.ctx());
+                }
+                ui.label(format!("Uses all {takes} recordings so far, including your Lines and Words."));
+                if self.busy.is_some() {
+                    ui.spinner();
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(&self.status);
+        });
+    }
+
+    fn save_characters(&self) {
+        let _ = serde_json::to_string_pretty(&self.characters).map(|t| std::fs::write(characters_path(), t));
+    }
+
+    fn say(&mut self) {
+        if self.g2p.is_none() {
+            match pipeline::load_g2p() {
+                Ok(g) => self.g2p = Some(g),
+                Err(e) => {
+                    self.speak_info = e;
+                    return;
+                }
+            }
+        }
+        let (Some(g2p), Some(loaded)) = (&self.g2p, &self.loaded) else { return };
+        let c = &self.characters[self.character];
+        match voice::speak(g2p, loaded, &self.say_text, c) {
+            Ok(spoken) => {
+                let x = voice::to_float_at_fs(&spoken.samples);
+                let _ = pipeline::write_wav(&format!("{}/last-spoken.wav", lab_dir()), &x);
+                self.speak_info = format!(
+                    "{:.1} s of speech | {} of {} joins substituted | ROM {} KB ({} joins) | RAM about {} bytes | CPU about {:.1}% of an N64 (estimate)",
+                    spoken.samples.len() as f64 / n64::OUT_RATE as f64,
+                    spoken.stats.borrowed_joins,
+                    spoken.stats.joins,
+                    loaded.rom_bytes / 1024,
+                    loaded.voice.joins(),
+                    n64::ram_bytes(spoken.events),
+                    voice::cpu_estimate_percent(&spoken.stats)
+                );
+                // a short gap, then "Keep reading" moves on
+                self.speak_until = Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(x.len() as f64 / pipeline::FS + 0.2));
+                self.player = None;
+                match audio::play(&x) {
+                    Ok(s) => self.player = Some(s),
+                    Err(e) => self.speak_info = format!("Couldn't play: {e}"),
+                }
+            }
+            Err(e) => {
+                self.speak_info = e;
+                // a sentence it can't say shouldn't end "Keep reading"
+                self.speak_until = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    fn book_step(&mut self, delta: isize) {
+        self.book_pos = self.book_pos.saturating_add_signed(delta).min(self.book.len() - 1);
+        self.say_text = self.book[self.book_pos].to_string();
+    }
+
+    fn speak_page(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Speak");
+            if self.loaded.is_none() {
+                ui.label("No voice yet. Record some sentences on the Read tab, then press Build voice.");
+                return;
+            }
+            ui.add(egui::TextEdit::multiline(&mut self.say_text).font(egui::TextStyle::Heading).desired_rows(3).desired_width(f32::INFINITY));
+            ui.add_space(6.0);
+            let mut speak_now = false;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("▶ Speak").size(20.0))).clicked() {
+                    speak_now = true;
+                }
+                if ui.add_enabled(self.player.is_some(), egui::Button::new("Stop")).clicked() {
+                    self.player = None;
+                    self.read_on = false;
+                    self.speak_until = None;
+                }
+                ui.separator();
+                ui.label("Character");
+                let shown = self.characters[self.character].name.clone();
+                egui::ComboBox::from_id_salt("character").selected_text(shown).show_ui(ui, |ui| {
+                    for (i, c) in self.characters.iter().enumerate() {
+                        ui.selectable_value(&mut self.character, i, c.name.clone());
+                    }
+                });
+                if ui.button("Copy as new").clicked() {
+                    let mut c = self.characters[self.character].clone();
+                    c.name = format!("Character {}", self.characters.len() + 1);
+                    self.characters.push(c);
+                    self.character = self.characters.len() - 1;
+                    self.save_characters();
+                }
+                if ui.add_enabled(self.characters.len() > 1, egui::Button::new("Delete")).clicked() {
+                    self.characters.remove(self.character);
+                    self.character = self.character.min(self.characters.len() - 1);
+                    self.save_characters();
+                }
+                if ui.button("Reset all").clicked() {
+                    self.characters = voice::Character::presets();
+                    self.character = 0;
+                    self.save_characters();
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Alice in Wonderland");
+                if ui.button("◀ Previous").clicked() {
+                    self.book_step(-1);
+                    speak_now = true;
+                }
+                if ui.button("Next ▶").clicked() {
+                    self.book_step(1);
+                    speak_now = true;
+                }
+                let last = self.book.len() - 1;
+                if ui.add(egui::Slider::new(&mut self.book_pos, 0..=last).text("sentence")).changed() {
+                    self.book_step(0);
+                }
+                ui.checkbox(&mut self.read_on, "Keep reading");
+            });
+            ui.add_space(10.0);
+            let mut changed = false;
+            let c = &mut self.characters[self.character];
+            egui::Grid::new("sliders").spacing([14.0, 10.0]).show(ui, |ui| {
+                ui.label("Name");
+                changed |= ui.text_edit_singleline(&mut c.name).changed();
+                ui.end_row();
+                let mut row = |ui: &mut egui::Ui, label: &str, value: &mut f64, range: std::ops::RangeInclusive<f64>, hint: &str| {
+                    ui.label(label);
+                    changed |= ui.add(egui::Slider::new(value, range).fixed_decimals(2)).changed();
+                    ui.weak(hint);
+                    ui.end_row();
+                };
+                row(ui, "Pitch (Hz)", &mut c.pitch, 50.0..=400.0, "how high the voice sits");
+                row(ui, "Expression", &mut c.range, 0.0..=2.5, "flat to sing-song");
+                row(ui, "Speed", &mut c.rate, 0.5..=2.0, "slow to fast");
+                row(ui, "Size", &mut c.size, 0.7..=1.4, "big body to small body");
+                row(ui, "Breathiness", &mut c.breath, 0.0..=1.0, "clear to whispery");
+                row(ui, "Brightness", &mut c.bright, -0.6..=0.8, "muffled to sharp");
+                row(ui, "Roughness", &mut c.rough, 0.0..=1.0, "smooth to gravelly");
+            });
+            if changed {
+                self.save_characters();
+            }
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(&self.speak_info);
+            ui.weak("The C library is the code that would go on the N64; the text-to-sounds step still runs on your PC.");
+            if speak_now {
+                self.say();
+            }
+        });
     }
 
     fn start_fit(&mut self, ctx: &egui::Context) {
@@ -357,6 +687,15 @@ impl App {
                     self.status = format!("Failed: {e}");
                     done = true;
                 }
+                Event::Built(Ok(r)) => {
+                    self.status = format!("Voice built from {} recordings: {} sound joins, {} KB. Open the Speak tab to try it.", r.takes, r.joins, r.rom_bytes / 1024);
+                    self.loaded = voice::load(&voice_path()).ok();
+                    done = true;
+                }
+                Event::Built(Err(e)) => {
+                    self.status = format!("Couldn't build the voice: {e}");
+                    done = true;
+                }
                 Event::Fitted(Ok(f)) => {
                     let e = f.error_pct();
                     self.status = format!("Fitted {} vowels (F1 within {:.1}%, F2 {:.1}%, F3 {:.1}% on average). On the Lines tab, press Compare on a line to hear it.", f.vowels.len(), e[0], e[1], e[2]);
@@ -378,6 +717,20 @@ fn hz(v: Option<f64>) -> String {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        if self.recording.is_some() {
+            self.read_on = false;
+        }
+        if self.read_on {
+            if self.speak_until.is_some_and(|t| std::time::Instant::now() >= t) {
+                if self.book_pos + 1 < self.book.len() {
+                    self.book_step(1);
+                    self.say();
+                } else {
+                    self.read_on = false;
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         let locked = self.recording.is_some() || self.busy.is_some();
         if self.recording.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -388,14 +741,31 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     let lines = ui.selectable_value(&mut self.page, Page::Lines, "Lines").clicked();
                     let words = ui.selectable_value(&mut self.page, Page::Vowels, "Words").clicked();
-                    if lines || words {
+                    let read = ui.selectable_value(&mut self.page, Page::Read, "Read").clicked();
+                    let speak = ui.selectable_value(&mut self.page, Page::Speak, "Speak").clicked();
+                    if lines || words || read || speak {
                         self.status.clear();
                     }
                 });
             });
         });
+        // a take in progress belongs to its sentence: another tab's Stop would save it over a Line
+        if self.recording_prompt.is_some() {
+            self.page = Page::Read;
+        }
         if self.page == Page::Vowels {
             self.vowels_page(ctx);
+            return;
+        }
+        if self.page == Page::Read {
+            if self.recording.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
+            self.read_page(ctx);
+            return;
+        }
+        if self.page == Page::Speak {
+            self.speak_page(ctx);
             return;
         }
 
@@ -562,7 +932,7 @@ unsafe extern "system" {
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(windows)]
-    if args.first().is_some_and(|a| a != "--words") {
+    if args.first().is_some_and(|a| a != "--words" && a != "--speak" && a != "--read") {
         const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
         // SAFETY: takes no pointers; failing just means there is no terminal to print to
         unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
@@ -573,6 +943,68 @@ fn main() -> Result<(), String> {
             return Ok(());
         }
         Some("--self-test") => return pipeline::self_test(),
+        Some("--select-prompts") => {
+            let (pool, out, n) = (args.get(1).ok_or("pool file?")?, args.get(2).ok_or("output file?")?, args.get(3).and_then(|n| n.parse().ok()).unwrap_or(150));
+            return voice::select_prompts(pool, out, n);
+        }
+        Some("--build-voice") => {
+            // a list of "wav<TAB>text" lines, then the voice file to write
+            let (list, out) = (args.get(1).ok_or("list file?")?, args.get(2).ok_or("output file?")?);
+            let text = std::fs::read_to_string(list).map_err(|e| format!("{list}: {e}"))?;
+            let takes: Vec<voice::Take> = text.lines().filter_map(|l| l.split_once('\t')).map(|(w, t)| voice::Take { wav: w.to_string(), text: t.to_string() }).collect();
+            let work = format!("{out}.work");
+            let r = voice::build(&takes, &work, out, &|s| println!("... {s}"))?;
+            let _ = std::fs::remove_dir_all(&work);
+            println!("{r:?}");
+            return Ok(());
+        }
+        Some("--ladder") => {
+            // a list of "wav<TAB>text" lines, the voice, and where to write the four stages
+            let (list, file, out) = (args.get(1).ok_or("list file?")?, args.get(2).ok_or("voice file?")?, args.get(3).ok_or("output folder?")?);
+            let text = std::fs::read_to_string(list).map_err(|e| format!("{list}: {e}"))?;
+            let takes: Vec<voice::Take> = text.lines().filter_map(|l| l.split_once('\t')).map(|(w, t)| voice::Take { wav: w.to_string(), text: t.to_string() }).collect();
+            return voice::ladder(&takes, file, out);
+        }
+        Some("--book-check") => {
+            // every sentence of the book through the synth: what breaks, what clips
+            let loaded = voice::load(args.get(1).ok_or("voice file?")?)?;
+            let g2p = pipeline::load_g2p()?;
+            let c = voice::Character::presets().remove(0);
+            let (mut samples, mut clipped, mut joins, mut borrowed, mut failed) = (0u64, 0u64, 0u64, 0u64, 0usize);
+            let started = std::time::Instant::now();
+            let lines: Vec<&str> = BOOK.lines().collect();
+            for line in &lines {
+                match voice::speak(&g2p, &loaded, line, &c) {
+                    Ok(s) => {
+                        samples += s.samples.len() as u64;
+                        clipped += s.samples.iter().filter(|v| v.unsigned_abs() >= 32767).count() as u64;
+                        joins += s.stats.joins as u64;
+                        borrowed += s.stats.borrowed_joins as u64;
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        if failed <= 15 {
+                            println!("failed: {e}: {line}");
+                        }
+                    }
+                }
+            }
+            let seconds = samples as f64 / n64::OUT_RATE as f64;
+            println!("{} sentences, {failed} failed; {:.1} minutes of speech in {:.1} s", lines.len(), seconds / 60.0, started.elapsed().as_secs_f64());
+            println!("joins {joins}, substituted {borrowed} ({:.2}%); clipped samples {clipped} ({:.4}%)", 100.0 * borrowed as f64 / joins.max(1) as f64, 100.0 * clipped as f64 / samples.max(1) as f64);
+            return Ok(());
+        }
+        Some("--say") => {
+            let (file, text, out) = (args.get(1).ok_or("voice file?")?, args.get(2).ok_or("text?")?, args.get(3).ok_or("output wav?")?);
+            let name = args.get(4).map_or("You", String::as_str);
+            let loaded = voice::load(file)?;
+            let g2p = pipeline::load_g2p()?;
+            let c = voice::Character::presets().into_iter().find(|c| c.name == name).ok_or("no such character")?;
+            let spoken = voice::speak(&g2p, &loaded, text, &c)?;
+            pipeline::write_wav(out, &voice::to_float_at_fs(&spoken.samples))?;
+            println!("{} samples, {} joins, {} borrowed; ROM {} bytes; RAM about {} bytes; CPU about {:.1}% (estimate)", spoken.samples.len(), spoken.stats.joins, spoken.stats.borrowed_joins, loaded.rom_bytes, n64::ram_bytes(spoken.events), voice::cpu_estimate_percent(&spoken.stats));
+            return Ok(());
+        }
         Some("--fit") => {
             let f = fit::fit_recordings(args.get(1).map_or("male", String::as_str))?;
             for v in &f.vowels {
@@ -607,6 +1039,8 @@ fn main() -> Result<(), String> {
     }
     chimera::init();
     let open_words = args.first().is_some_and(|a| a == "--words");
+    let open_speak = args.first().is_some_and(|a| a == "--speak");
+    let open_read = args.first().is_some_and(|a| a == "--read");
     let options =eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_title("CHIMERA Voice Lab").with_inner_size([1120.0, 720.0]), ..Default::default() };
     eframe::run_native(
         "CHIMERA Voice Lab",
@@ -617,6 +1051,12 @@ fn main() -> Result<(), String> {
             if open_words {
                 app.page = Page::Vowels;
                 app.status.clear();
+            }
+            if open_speak {
+                app.page = Page::Speak;
+            }
+            if open_read {
+                app.page = Page::Read;
             }
             Ok(Box::new(app))
         }),
