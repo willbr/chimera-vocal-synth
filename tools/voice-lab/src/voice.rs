@@ -715,6 +715,7 @@ pub struct LoadedVoice {
     pub pulse: Vec<i16>,
     /// how long this speaker holds each phone against the planner, Q6
     pub scales: Vec<u8>,
+    pub joins: HashSet<(u8, u8)>,
     pub voice: Voice,
     pub phones: HashMap<String, u8>,
     pub rom_bytes: usize,
@@ -749,8 +750,13 @@ pub fn load(path: &str) -> Result<LoadedVoice, String> {
     let rom_bytes = b.len();
     let pulse_at = at + 257 * 2;
     let pulse = b.get(pulse_at..pulse_at + PULSE_LEN * 2).ok_or_else(bad)?.chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+    let index_at = pulse_at + PULSE_LEN * 2;
+    let head = b.get(index_at..index_at + 2).ok_or_else(bad)?;
+    let join_count = u16::from_le_bytes([head[0], head[1]]) as usize;
+    let table = b.get(index_at + 2..index_at + 2 + join_count * 10).ok_or_else(bad)?;
+    let joins = table.chunks(10).map(|e| (e[0], e[1])).collect();
     let voice = Voice::from_bytes(b).ok_or_else(bad)?;
-    Ok(LoadedVoice { pulse, scales, voice, phones, rom_bytes })
+    Ok(LoadedVoice { pulse, scales, joins, voice, phones, rom_bytes })
 }
 
 /// A character: all the tweakable settings.
@@ -790,10 +796,50 @@ pub struct Spoken {
     pub samples: Vec<i16>,
     pub stats: Stats,
     pub events: usize,
+    pub words: Vec<SpokenWord>,
+}
+
+/// A word as written, and when it's said, in seconds from the start of the audio.
+#[derive(Clone, Debug)]
+pub struct SpokenWord {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// A word or stretch the listener marked for later review.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Note {
+    pub sentence: String,
+    pub words: String,
+    pub note: String,
+    pub character: String,
+    pub start: f64,
+    pub end: f64,
+    pub when: u64,
+}
+
+/// Each spoken word: the front end's text for it, and its first and last event.
+type WordMarks = Vec<(String, usize, usize)>;
+
+/// The front end lower-cases and spells out what it says; show the word as it was typed when it can be found.
+fn display_words(text: &str, said: &[String]) -> Vec<String> {
+    let tokens: Vec<&str> = text.split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '\u{2019}' || c == '-')).filter(|t| !t.is_empty()).collect();
+    let mut at = 0;
+    said.iter()
+        .map(|w| match tokens[at..].iter().position(|t| t.replace('\u{2019}', "'").eq_ignore_ascii_case(w)) {
+            Some(k) => {
+                let token = tokens[at + k];
+                at += k + 1;
+                token.to_string()
+            }
+            None => w.clone(),
+        })
+        .collect()
 }
 
 /// Text to the synth's events: British phones, the planner's durations, a simple pitch contour.
-pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Character) -> Result<Vec<Event>, String> {
+pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Character) -> Result<(Vec<Event>, WordMarks), String> {
     let phrases = g2p.to_phrases(text);
     if phrases.is_empty() {
         return Err("nothing to say".to_string());
@@ -807,6 +853,8 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
     let to_samples = |s: f64| ((s / c.rate) * FS_OUT).round().max(160.0) as u32;
     let hz = |f: f64| (f.clamp(40.0, 600.0) * 16.0) as u32;
     let mut events = vec![Event { phone: silence, samples: 3200, f0: hz(c.pitch) }];
+    let said: Vec<String> = phrases.iter().flat_map(|p| p.words.iter().cloned()).collect();
+    let mut marks: Vec<Option<(usize, usize)>> = vec![None; said.len()];
     for (pi, phrase) in phrases.iter().enumerate() {
         let in_phrase: Vec<_> = spans.iter().filter(|s| s.phrase == pi).collect();
         let phone_count: usize = in_phrase.iter().map(|s| s.count).sum();
@@ -828,20 +876,56 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
                     }
                 }
                 let phone = phone_id(&s.ipa).unwrap_or(schwa);
+                if let Some(mark) = marks.get_mut(span.word) {
+                    let first = mark.map_or(events.len(), |m| m.0);
+                    *mark = Some((first, events.len()));
+                }
                 events.push(Event { phone, samples: to_samples((s.t1 - s.t0) * voice.scale(phone)), f0: hz(f) });
                 done += 1;
             }
         }
         events.push(Event { phone: silence, samples: to_samples(phrase.pause.max(0.1)), f0: hz(c.pitch * 0.9) });
     }
-    Ok(events)
+    let marks = said.into_iter().zip(marks).filter_map(|(w, m)| m.map(|(a, b)| (w, a, b))).collect();
+    Ok((events, marks))
+}
+
+/// What the synth will do for a piece of text, sound by sound, to find out why a word sounds wrong.
+pub fn explain(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Character) -> Result<String, String> {
+    let (events, marks) = events_for(g2p, voice, text, c)?;
+    let names: HashMap<u8, &str> = voice.phones.iter().map(|(n, i)| (*i, n.as_str())).collect();
+    let mut out = String::new();
+    for (word, first, last) in &marks {
+        out.push_str(word);
+        out.push_str(":");
+        for k in *first..=*last {
+            let e = &events[k];
+            out.push_str(&format!(" {}({}ms)", names.get(&e.phone).copied().unwrap_or("?"), e.samples / 16));
+            if k + 1 <= *last && !voice.joins.contains(&(e.phone, events[k + 1].phone)) {
+                out.push_str(" [no join to next: borrowed]");
+            }
+        }
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 pub fn speak(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Character) -> Result<Spoken, String> {
-    let events = events_for(g2p, voice, text, c)?;
+    let (events, marks) = events_for(g2p, voice, text, c)?;
     let mut samples = vec![0i16; n64::output_len(&events)];
     let stats = n64::render(&voice.voice, &events, &c.params(), &mut samples);
-    Ok(Spoken { samples, stats, events: events.len() })
+    // the audio starts halfway through the first event
+    let head = (events[0].samples / 2) as f64;
+    let mut starts = Vec::with_capacity(events.len() + 1);
+    let mut sum = 0.0;
+    for e in &events {
+        starts.push(sum);
+        sum += e.samples as f64;
+    }
+    starts.push(sum);
+    let said: Vec<String> = marks.iter().map(|m| m.0.clone()).collect();
+    let words = marks.iter().zip(display_words(text, &said)).map(|((_, a, b), shown)| SpokenWord { text: shown, start: (starts[*a] - head) / FS_OUT, end: (starts[*b + 1] - head) / FS_OUT }).collect();
+    Ok(Spoken { samples, stats, events: events.len(), words })
 }
 
 /// Rough share of the console's 93.75 MHz CPU to speak in real time: my estimate, not a measurement.
