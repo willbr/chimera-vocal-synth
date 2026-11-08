@@ -266,7 +266,7 @@ fn aligner_labels(ipa: &str, next: Option<&str>) -> Option<Vec<&'static str>> {
         "i" => one("iː"),
         "ɪ" => one("ɪ"),
         "eɪ" => one("ej"),
-        "ɛ" => one("ɛ"),
+        "ɛ" => Some(vec!["ɛ", "ɛː"]),
         "æ" => one("a"),
         "aɪ" => one("aj"),
         "aʊ" => one("aw"),
@@ -321,6 +321,23 @@ fn pronunciations(units: &[Unit]) -> Vec<String> {
     all
 }
 
+/// One label per planned segment. A diphthong's glide is its own sound: without this the end of
+/// "days" is filed as the "ee" of "please", and either word can borrow the other's piece.
+fn phone_labels(phrases: &[chimera::phonetics::english::Phrase], planned: &chimera::phonetics::Plan, spans: &[pipeline::SegSpan]) -> Vec<String> {
+    let mut labels = vec![String::new(); planned.segments.len()];
+    let ipa = |n: usize| phrases[spans[n].phrase].segments[spans[n].seg].ipa.as_str();
+    let in_word = |a: usize, b: usize| spans.get(a).is_some_and(|x| spans.get(b).is_some_and(|y| x.word == y.word));
+    for (n, span) in spans.iter().enumerate() {
+        let goat = (ipa(n) == "ə" && in_word(n, n + 1) && ipa(n + 1) == "ʊ") || (ipa(n) == "ʊ" && n > 0 && in_word(n - 1, n) && ipa(n - 1) == "ə");
+        for part in 0..span.count {
+            let base = &planned.segments[span.first + part].ipa;
+            let glide = goat || (span.count == 2 && part == 1);
+            labels[span.first + part] = if glide { format!("{base}'") } else { base.clone() };
+        }
+    }
+    labels
+}
+
 struct Planned {
     words: Vec<Vec<Unit>>,
     segments: Vec<(String, f64, usize)>,
@@ -335,7 +352,8 @@ fn plan_take(g2p: &EnglishG2P, text: &str) -> Result<Planned, String> {
     let phrases = crate::british::southern_british(g2p, &phrases, "male", 112.0, false)?;
     let planned = plan(&inputs(&phrases), "male", 112.0);
     let spans = seg_spans(&phrases, &planned.segments)?;
-    let segments = spans.iter().flat_map(|sp| (sp.first..sp.first + sp.count).map(|k| (planned.segments[k].ipa.clone(), planned.segments[k].t1 - planned.segments[k].t0, sp.phrase))).collect();
+    let labels = phone_labels(&phrases, &planned, &spans);
+    let segments = spans.iter().flat_map(|sp| (sp.first..sp.first + sp.count).map(|k| (labels[k].clone(), planned.segments[k].t1 - planned.segments[k].t0, sp.phrase))).collect();
     let word_count = spans.last().map_or(0, |s| s.word + 1);
     let mut words = Vec::with_capacity(word_count);
     for w in 0..word_count {
@@ -461,7 +479,7 @@ fn mark_voiced(an: &mut Analysis, times: &[(String, f64, f64, usize)]) {
     }
     let frame = |t: f64| (((t - 0.0125) / 0.01).round() as isize).clamp(0, count - 1) as usize;
     for (ipa, t0, t1, _) in times {
-        if matches!(ipa.as_str(), "a" | "e" | "i" | "u" | "æ" | "ɑ" | "ɒ" | "ɔ" | "ə" | "ɛ" | "ɪ" | "ʊ" | "ʌ" | "ɐ" | "m" | "n" | "ŋ" | "l" | "ɫ" | "ɹ" | "w" | "j") {
+        if matches!(ipa.trim_end_matches('\''), "a" | "e" | "i" | "u" | "æ" | "ɑ" | "ɒ" | "ɔ" | "ə" | "ɛ" | "ɪ" | "ʊ" | "ʌ" | "ɐ" | "m" | "n" | "ŋ" | "l" | "ɫ" | "ɹ" | "w" | "j") {
             for i in frame(*t0)..=frame(*t1) {
                 let f = &mut an.frames[i];
                 if f.gain >= 70 {
@@ -847,6 +865,7 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
     let phrases = crate::british::southern_british(g2p, &phrases, "male", 112.0, false)?;
     let planned = plan(&inputs(&phrases), "male", 112.0);
     let spans = seg_spans(&phrases, &planned.segments)?;
+    let labels = phone_labels(&phrases, &planned, &spans);
     let phone_id = |ipa: &str| -> Option<u8> { voice.phones.get(ipa).copied() };
     let silence = phone_id(SILENCE).ok_or("the voice has no silence")?;
     let schwa = phone_id("ə").unwrap_or(silence);
@@ -875,12 +894,18 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
                         Intonation::Flat => {}
                     }
                 }
-                let phone = phone_id(&s.ipa).unwrap_or(schwa);
+                let phone = phone_id(&labels[k]).or_else(|| phone_id(&s.ipa)).unwrap_or(schwa);
+                // the speaker's median shortens every example of a vowel, but "do" and "you" still need saying
+                let floor = match labels[k].as_str() {
+                    "ə" => 0.055,
+                    "i" | "ɪ" | "ɛ" | "æ" | "ɑ" | "ɒ" | "ɔ" | "ʊ" | "u" | "ʌ" | "ɐ" => 0.08,
+                    _ => 0.0,
+                };
                 if let Some(mark) = marks.get_mut(span.word) {
                     let first = mark.map_or(events.len(), |m| m.0);
                     *mark = Some((first, events.len()));
                 }
-                events.push(Event { phone, samples: to_samples((s.t1 - s.t0) * voice.scale(phone)), f0: hz(f) });
+                events.push(Event { phone, samples: to_samples(((s.t1 - s.t0) * voice.scale(phone)).max(floor)), f0: hz(f) });
                 done += 1;
             }
         }

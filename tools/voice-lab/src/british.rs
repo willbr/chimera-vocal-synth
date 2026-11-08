@@ -30,6 +30,8 @@ struct Out {
     split: Option<(&'static str, &'static str)>,
     /// the "nurse" vowel: said as ə unless a fitted one exists
     nurse: bool,
+    /// on top of the planner's length: "air" keeps the time its lost /r/ gave it
+    stretch: f64,
 }
 
 fn rewrite(g2p: &EnglishG2P, phrase: &Phrase) -> Vec<Out> {
@@ -59,6 +61,7 @@ fn rewrite(g2p: &EnglishG2P, phrase: &Phrase) -> Vec<Out> {
                             prev.seg.ipa = "ʊ".to_string();
                             prev.split = Some(("ʊ", "ə"));
                         }
+                        "ɛ" => prev.stretch = 1.7,
                         _ => {}
                     }
                     if s.word_end == Some(true) {
@@ -77,9 +80,9 @@ fn rewrite(g2p: &EnglishG2P, phrase: &Phrase) -> Vec<Out> {
                     let mut r = Segment { ipa: "ɹ".to_string(), stress: Some(0), word_end: s.word_end, ..Default::default() };
                     seg.ipa = if s.ipa == "ɝ" { "ʌ" } else { "ə" }.to_string();
                     seg.word_end = None;
-                    out.push(Out { seg, split: None, nurse: false });
+                    out.push(Out { seg, split: None, nurse: false, stretch: 1.0 });
                     r.dur = None;
-                    out.push(Out { seg: r, split: None, nurse: false });
+                    out.push(Out { seg: r, split: None, nurse: false, stretch: 1.0 });
                     if s.word_end == Some(true) {
                         word += 1;
                     }
@@ -89,6 +92,10 @@ fn rewrite(g2p: &EnglishG2P, phrase: &Phrase) -> Vec<Out> {
                 nurse = s.ipa == "ɝ";
             }
             "oʊ" => split = Some(("ə", "ʊ")),
+            // "the air" is "thee air"
+            "ə" if w == "the" && s.word_end == Some(true) && vowel_next => seg.ipa = "i".to_string(),
+            // "passage", "village": southern English has ɪ here
+            "ə" if s.stress != Some(1) && segs.get(i + 1).is_some_and(|n| n.ipa == "dʒ" && n.word_end == Some(true)) => seg.ipa = "ɪ".to_string(),
             "æ" if long_a(w) => seg.ipa = "ɑ".to_string(),
             "ɑ" if !coda_r_next && !long_a(w) => seg.ipa = "ɒ".to_string(),
             "ɔ" if segs.get(i + 1).is_some_and(|n| ["f", "θ", "s", "ŋ", "g"].contains(&n.ipa.as_str())) => seg.ipa = "ɒ".to_string(),
@@ -97,7 +104,7 @@ fn rewrite(g2p: &EnglishG2P, phrase: &Phrase) -> Vec<Out> {
         if s.word_end == Some(true) {
             word += 1;
         }
-        out.push(Out { seg, split, nurse });
+        out.push(Out { seg, split, nurse, stretch: 1.0 });
     }
     out
 }
@@ -124,7 +131,7 @@ pub fn southern_british(g2p: &EnglishG2P, phrases: &[Phrase], body: &str, f0: f6
                 parts[span.phrase].push(seg);
             }
             None => {
-                seg.dur = Some(dur);
+                seg.dur = Some(dur * out.stretch);
                 if out.nurse && fitted_nurse {
                     seg.ipa = "ɐ".to_string();
                 }
