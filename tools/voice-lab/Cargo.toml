@@ -1,0 +1,22 @@
+# A throwaway spike: record a line, align it to the engine's own render, compare the two.
+# Its own workspace on purpose, so `cargo test --workspace` and the wasm build never compile a GUI.
+[workspace]
+
+[package]
+name = "voice-lab"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chimera = { path = "../../crates/chimera" }
+cpal = "0.15"
+eframe = "0.31"
+flate2 = "1"
+hound = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = false
