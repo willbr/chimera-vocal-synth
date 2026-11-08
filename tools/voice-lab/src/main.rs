@@ -190,6 +190,7 @@ impl App {
             spoken_text: String::new(),
         };
         app.prompts = std::fs::read_to_string(repo_path("out/voice-lab/prompts.txt")).map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect()).unwrap_or_default();
+        app.prompts.extend(include_str!("../books/alice-prompts.txt").lines().map(str::to_string));
         app.prompt_done = (0..app.prompts.len()).map(|i| Path::new(&prompt_wav(i)).exists()).collect();
         app.prompt = app.prompt_done.iter().position(|d| !d).unwrap_or(0);
         app.load_report();
@@ -1151,6 +1152,11 @@ fn main() -> Result<(), String> {
             println!("{} sentences, {failed} failed; {:.1} minutes of speech in {:.1} s", lines.len(), seconds / 60.0, started.elapsed().as_secs_f64());
             println!("joins {joins}, substituted {borrowed} ({:.2}%); clipped samples {clipped} ({:.4}%)", 100.0 * borrowed as f64 / joins.max(1) as f64, 100.0 * clipped as f64 / samples.max(1) as f64);
             return Ok(());
+        }
+        Some("--select-targeted") => {
+            let need = |i: usize, what: &'static str| args.get(i).ok_or(what);
+            let n = args.get(5).and_then(|n| n.parse().ok()).unwrap_or(100);
+            return voice::select_targeted(need(1, "book?")?, need(2, "recorded list?")?, need(3, "sentences to leave out?")?, need(4, "output file?")?, n);
         }
         Some("--explain") => {
             // what the synth does for a piece of text, sound by sound

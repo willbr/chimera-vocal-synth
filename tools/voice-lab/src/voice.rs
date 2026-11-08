@@ -970,6 +970,65 @@ pub fn to_float_at_fs(x: &[i16]) -> Vec<f32> {
     resample(&f, FS_OUT, FS)
 }
 
+// ---- choosing what to read next
+
+/// Words the speaker reported sounding wrong: their joins count double.
+const FLAGGED: &str = "daisies please she'll do you for leaves passage seen pegs empty the air down";
+
+/// Greedy choice of book sentences for the joins with the fewest recorded examples. Takes sentences
+/// only before `CHAPTER IX`, and never one listed in `exclude`, so the rest of the book stays a fair test.
+pub fn select_targeted(book: &str, recorded: &str, exclude: &str, out: &str, count: usize) -> Result<(), String> {
+    const ENOUGH: usize = 3;
+    type Join = (String, String);
+    let g2p = pipeline::load_g2p()?;
+    let joins_of = |text: &str| -> Option<(HashSet<Join>, Vec<Join>, usize)> {
+        let p = plan_take(&g2p, text).ok()?;
+        let all: Vec<Join> = p.segments.windows(2).filter(|w| w[0].2 == w[1].2).map(|w| (w[0].0.clone(), w[1].0.clone())).collect();
+        Some((all.iter().cloned().collect(), all, p.segments.len()))
+    };
+    let mut have: HashMap<Join, usize> = HashMap::new();
+    for line in std::fs::read_to_string(recorded).map_err(|e| format!("{recorded}: {e}"))?.lines() {
+        let Some((_, text)) = line.split_once('\t') else { continue };
+        if let Some((_, all, _)) = joins_of(text) {
+            for j in all {
+                *have.entry(j).or_default() += 1;
+            }
+        }
+    }
+    let excluded: HashSet<String> = std::fs::read_to_string(exclude).map_err(|e| format!("{exclude}: {e}"))?.lines().map(|l| l.trim().to_string()).collect();
+    let flagged: HashSet<Join> = FLAGGED.split(' ').filter_map(|w| joins_of(w)).flat_map(|(set, _, _)| set).collect();
+    let text = std::fs::read_to_string(book).map_err(|e| format!("{book}: {e}"))?;
+    let (mut pool, mut frequency) = (Vec::new(), HashMap::<Join, f64>::new());
+    for line in text.lines().take_while(|l| !l.starts_with("CHAPTER IX")) {
+        let words = line.split_whitespace().count();
+        let Some((set, all, phones)) = joins_of(line) else { continue };
+        for j in all {
+            *frequency.entry(j).or_default() += 1.0;
+        }
+        if (5..=14).contains(&words) && !line.starts_with("CHAPTER") && !line.chars().any(|c| c.is_ascii_digit()) && !excluded.contains(line.trim()) {
+            pool.push((line.to_string(), set, phones));
+        }
+    }
+    let short = |have: &HashMap<Join, usize>| frequency.keys().filter(|j| have.get(*j).copied().unwrap_or(0) < ENOUGH).count();
+    let before = short(&have);
+    let mut chosen = Vec::new();
+    while chosen.len() < count && !pool.is_empty() {
+        let value = |p: &(String, HashSet<Join>, usize)| {
+            let sum: f64 = p.1.iter().filter(|j| have.get(*j).copied().unwrap_or(0) < ENOUGH).map(|j| frequency.get(j).copied().unwrap_or(1.0).ln_1p() * if flagged.contains(j) { 2.0 } else { 1.0 } / (1 + have.get(j).copied().unwrap_or(0)) as f64).sum();
+            sum / p.2 as f64
+        };
+        let best = (0..pool.len()).max_by(|a, b| value(&pool[*a]).total_cmp(&value(&pool[*b]))).ok_or("empty pool")?;
+        let picked = pool.swap_remove(best);
+        for j in &picked.1 {
+            *have.entry(j.clone()).or_default() += 1;
+        }
+        chosen.push(picked.0);
+    }
+    std::fs::write(out, chosen.join("\n") + "\n").map_err(|e| format!("{out}: {e}"))?;
+    println!("chose {} sentences; joins in chapters I-VIII with under {ENOUGH} examples: {before} before, {} after, of {}", chosen.len(), short(&have), frequency.len());
+    Ok(())
+}
+
 // ---- finding which stage loses the words
 
 fn filled_pitch(f0: &[f64]) -> Vec<f64> {
