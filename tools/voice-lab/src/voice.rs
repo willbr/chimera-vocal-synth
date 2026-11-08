@@ -452,6 +452,26 @@ fn mfa_align(g2p: &EnglishG2P, takes: &[Take], work: &str) -> Result<Vec<Result<
     Ok(planned.iter().enumerate().map(|(i, p)| read_alignment(&format!("{output}/t{i}.json"), p.as_ref().map_err(|e| e.clone())?)).collect())
 }
 
+/// Vowels, nasals and approximants are voiced whatever the pitch tracker said: it gave up on many
+/// loud vowel frames, and a frame stored as unvoiced plays as pure noise. A little noise stays.
+fn mark_voiced(an: &mut Analysis, times: &[(String, f64, f64, usize)]) {
+    let count = an.frames.len() as isize;
+    if count == 0 {
+        return;
+    }
+    let frame = |t: f64| (((t - 0.0125) / 0.01).round() as isize).clamp(0, count - 1) as usize;
+    for (ipa, t0, t1, _) in times {
+        if matches!(ipa.as_str(), "a" | "e" | "i" | "u" | "æ" | "ɑ" | "ɒ" | "ɔ" | "ə" | "ɛ" | "ɪ" | "ʊ" | "ʌ" | "ɐ" | "m" | "n" | "ŋ" | "l" | "ɫ" | "ɹ" | "w" | "j") {
+            for i in frame(*t0)..=frame(*t1) {
+                let f = &mut an.frames[i];
+                if f.gain >= 70 {
+                    f.voiced = f.voiced.max(14);
+                }
+            }
+        }
+    }
+}
+
 fn analysis_of(take: &Take) -> Result<Analysis, String> {
     let mine = read_wav(&take.wav)?;
     Ok(analyze(&resample(&mine, FS, FS_OUT)))
@@ -459,7 +479,8 @@ fn analysis_of(take: &Take) -> Result<Analysis, String> {
 
 fn align_take(take: &Take, times: &Result<PhoneTimes, String>) -> Result<(Vec<Candidate>, Analysis), String> {
     let times = times.as_ref().map_err(|e| format!("{}: {e}", take.wav))?;
-    let analysis = analysis_of(take)?;
+    let mut analysis = analysis_of(take)?;
+    mark_voiced(&mut analysis, times);
     let dur = analysis.frames.len() as f64 * 0.01;
     // frame i is centred half a window (12.5 ms) after its start
     let frame_at = |t: f64| (((t - 0.0125) / 0.01).round() as isize).clamp(0, analysis.frames.len() as isize - 1) as usize;
@@ -976,7 +997,12 @@ pub fn ladder(takes: &[Take], voice_path: &str, out_dir: &str) -> Result<(), Str
         recordings.push(read_wav(&t.wav)?);
     }
     let located: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = takes.iter().zip(&times).map(|(t, found)| s.spawn(move || -> Result<(PhoneTimes, Analysis), String> { Ok((found.clone()?, analysis_of(t)?)) })).collect();
+        let handles: Vec<_> = takes.iter().zip(&times).map(|(t, found)| s.spawn(move || -> Result<(PhoneTimes, Analysis), String> {
+            let found = found.clone()?;
+            let mut an = analysis_of(t)?;
+            mark_voiced(&mut an, &found);
+            Ok((found, an))
+        })).collect();
         handles.into_iter().map(|h| h.join().expect("analysis thread")).collect()
     });
     let stages = ["1-recording", "2-copy", "2a-own-cuts", "2b-own-cuts-our-timing", "3-joins", "4-tts"];
