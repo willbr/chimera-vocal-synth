@@ -51,6 +51,24 @@ fn next_prompt(skip: &[bool], from: usize, forward: bool) -> Option<usize> {
     if forward { (from + 1..skip.len()).find(|&i| !skip[i]) } else { (0..from).rev().find(|&i| !skip[i]) }
 }
 
+/// For each word of a spoken sentence, the open notes on it, by index into `notes`. A note is
+/// found by its words, then by the closest time, because timing moves as voices change.
+fn notes_on_words(notes: &[voice::Note], sentence: &str, words: &[voice::SpokenWord]) -> Vec<Vec<usize>> {
+    let mut out = vec![Vec::new(); words.len()];
+    for (index, n) in notes.iter().enumerate().filter(|(_, n)| !n.fixed && n.sentence == sentence) {
+        let wanted: Vec<&str> = n.words.split(' ').collect();
+        let starts = 0..words.len().saturating_sub(wanted.len() - 1);
+        let matches = starts.filter(|&i| wanted.iter().enumerate().all(|(k, w)| words[i + k].text == *w));
+        let distance = |i: usize| (words[i].start - n.start).abs();
+        if let Some(i) = matches.min_by(|&a, &b| distance(a).total_cmp(&distance(b))) {
+            for k in 0..wanted.len() {
+                out[i + k].push(index);
+            }
+        }
+    }
+    out
+}
+
 fn characters_path() -> String {
     format!("{}/characters.json", lab_dir())
 }
@@ -142,6 +160,8 @@ struct App {
     play_end: f64,
     selection: Option<(usize, usize)>,
     note_text: String,
+    /// The notes open for editing, by index into `notes`, each with its text so far.
+    note_edits: Vec<(usize, String)>,
     notes: Vec<voice::Note>,
     spoken_text: String,
     show_fixed: bool,
@@ -197,6 +217,7 @@ impl App {
             play_end: 0.0,
             selection: None,
             note_text: String::new(),
+            note_edits: Vec::new(),
             notes: std::fs::read_to_string(notes_path()).map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default(),
             spoken_text: String::new(),
             show_fixed: false,
@@ -501,24 +522,6 @@ impl App {
         }
     }
 
-    /// For each word of the sentence on screen, the open note on it, if there is one. A note is
-    /// found by its words, then by the closest time, because timing moves as voices change.
-    fn noted_words(&self) -> Vec<Option<String>> {
-        let mut out = vec![None; self.spoken_words.len()];
-        for n in self.notes.iter().filter(|n| !n.fixed && n.sentence == self.spoken_text) {
-            let wanted: Vec<&str> = n.words.split(' ').collect();
-            let starts = 0..self.spoken_words.len().saturating_sub(wanted.len() - 1);
-            let matches = starts.filter(|&i| wanted.iter().enumerate().all(|(k, w)| self.spoken_words[i + k].text == *w));
-            let distance = |i: usize| (self.spoken_words[i].start - n.start).abs();
-            if let Some(i) = matches.min_by(|&a, &b| distance(a).total_cmp(&distance(b))) {
-                for k in 0..wanted.len() {
-                    out[i + k] = Some(n.note.clone());
-                }
-            }
-        }
-        out
-    }
-
     fn save_note(&mut self, a: usize, b: usize) {
         let words: Vec<&str> = self.spoken_words[a..=b].iter().map(|w| w.text.as_str()).collect();
         let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -600,7 +603,7 @@ impl App {
                 }
                 let mut clicked = None;
                 let selection = self.selection;
-                let noted = self.noted_words();
+                let noted = notes_on_words(&self.notes, &self.spoken_text, &self.spoken_words);
                 ui.horizontal_wrapped(|ui| {
                     for (i, w) in self.spoken_words.iter().enumerate() {
                         let mut text = egui::RichText::new(&w.text).size(22.0);
@@ -608,19 +611,20 @@ impl App {
                             text = text.background_color(egui::Color32::from_rgb(255, 214, 90)).color(egui::Color32::BLACK);
                         } else if selection.is_some_and(|(a, b)| i >= a && i <= b) {
                             text = text.background_color(egui::Color32::from_rgb(170, 205, 255)).color(egui::Color32::BLACK);
-                        } else if noted[i].is_some() {
+                        } else if !noted[i].is_empty() {
                             text = text.background_color(egui::Color32::from_rgb(255, 190, 190)).color(egui::Color32::BLACK);
                         }
                         let mut label = ui.add(egui::Label::new(text).sense(egui::Sense::click()).selectable(false)).on_hover_cursor(egui::CursorIcon::PointingHand);
-                        if let Some(note) = &noted[i] {
-                            label = label.on_hover_text(note);
+                        if !noted[i].is_empty() {
+                            let notes: Vec<&str> = noted[i].iter().map(|&n| self.notes[n].note.as_str()).collect();
+                            label = label.on_hover_text(notes.join("\n"));
                         }
                         if label.clicked() {
                             clicked = Some(i);
                         }
                     }
                 });
-                ui.weak("Click a word to hear it. Shift-click another to take the whole stretch. Pink words have an open note.");
+                ui.weak("Click a word to hear it. Shift-click another to take the whole stretch. Pink words have an open note: click one to edit it, then shift-click it to add another.");
                 if let Some(i) = clicked {
                     let shift = ui.input(|k| k.modifiers.shift);
                     let (a, b) = match self.selection {
@@ -628,9 +632,29 @@ impl App {
                         _ => (i, i),
                     };
                     self.selection = Some((a, b));
+                    // a plain click opens the notes already on the word; shift-click starts a new one
+                    self.note_edits = if shift { Vec::new() } else { noted[i].iter().map(|&n| (n, self.notes[n].note.clone())).collect() };
                     self.play_words(a, b);
                 }
-                if let Some((a, b)) = self.selection {
+                let mut saved_edit = None;
+                for (row, (n, text)) in self.note_edits.iter_mut().enumerate() {
+                    let note = &self.notes[*n];
+                    let can_save = !text.trim().is_empty() && text.trim() != note.note;
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Note on \"{}\":", note.words));
+                        let field = ui.add(egui::TextEdit::singleline(text).hint_text("what sounds wrong?").desired_width(360.0));
+                        let enter = field.lost_focus() && ui.input(|k| k.key_pressed(egui::Key::Enter));
+                        if ui.add_enabled(can_save, egui::Button::new("Save note")).clicked() || (enter && can_save) {
+                            saved_edit = Some(row);
+                        }
+                    });
+                }
+                if let Some(row) = saved_edit {
+                    let (n, text) = &self.note_edits[row];
+                    self.notes[*n].note = text.trim().to_string();
+                    self.save_notes();
+                }
+                if let (Some((a, b)), true) = (self.selection, self.note_edits.is_empty()) {
                     let mut save = false;
                     ui.horizontal(|ui| {
                         let words: Vec<&str> = self.spoken_words[a..=b].iter().map(|w| w.text.as_str()).collect();
@@ -729,6 +753,8 @@ impl App {
                 }
                 if let Some(i) = remove {
                     self.notes.remove(i);
+                    // the indices of any notes open for editing have just moved
+                    self.note_edits.clear();
                     self.save_notes();
                 }
             }
@@ -1303,7 +1329,24 @@ fn main() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::next_prompt;
+    use super::{next_prompt, notes_on_words, voice};
+
+    fn note(sentence: &str, words: &str, start: f64, fixed: bool) -> voice::Note {
+        voice::Note { sentence: sentence.into(), words: words.into(), note: "n".into(), character: "You".into(), start, end: start, when: 0, fixed }
+    }
+
+    #[test]
+    fn clicking_a_word_finds_every_open_note_on_it_to_edit() {
+        let words: Vec<voice::SpokenWord> = ["a", "b", "a"].iter().enumerate().map(|(i, t)| voice::SpokenWord { text: t.to_string(), start: i as f64, end: i as f64 + 1.0 }).collect();
+        let notes = [
+            note("a b a", "a", 2.1, false),  // the later "a", by time
+            note("a b a", "a", 1.9, false),  // a second note on that word: both must open
+            note("a b a", "b", 1.0, true),   // fixed: a click adds a new note instead
+            note("other", "b", 1.0, false),  // another sentence
+            note("a b a", "b a", 1.0, false), // a stretch counts for each of its words
+        ];
+        assert_eq!(notes_on_words(&notes, "a b a", &words), vec![vec![], vec![4], vec![0, 1, 4]]);
+    }
 
     #[test]
     fn reading_on_passes_over_sentences_from_earlier_sessions() {
