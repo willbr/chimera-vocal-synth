@@ -74,6 +74,8 @@ fn rewrite(g2p: &EnglishG2P, phrase: &Phrase) -> Vec<Out> {
                 continue;
             }
             "ɾ" if same_shape => seg.ipa = base[i].ipa.clone(),
+            // these keep their vowel even unstressed: a bare schwa is heard as a stray "uh"
+            "ɚ" | "ə" if w == "or" || w == "nor" => seg.ipa = "ɔ".to_string(),
             "ɚ" | "ɝ" => {
                 if vowel_next {
                     // "water all", "hurry": the /r/ survives before a vowel

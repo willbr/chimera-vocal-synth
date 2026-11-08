@@ -178,7 +178,7 @@ fn analyze(x16: &[f32]) -> Analysis {
         }
         prev = lsf;
         let p = yin_pitch(&raw[start..start + WINDOW.min(raw.len() - start)], FS_OUT, yin);
-        let voiced = if p.f0 > 0.0 && gain > 70 { ((1.0 - p.aperiodicity) * 15.0).round().clamp(0.0, 15.0) as u8 } else { 0 };
+        let voiced = if p.f0 > 0.0 && gain > 30 { ((1.0 - p.aperiodicity) * 15.0).round().clamp(0.0, 15.0) as u8 } else { 0 };
         f0s.push(if voiced > 0 { p.f0 } else { 0.0 });
         frames.push(Frame { lsf, gain, voiced });
         filters.push(filter);
@@ -470,8 +470,9 @@ fn mfa_align(g2p: &EnglishG2P, takes: &[Take], work: &str) -> Result<Vec<Result<
     Ok(planned.iter().enumerate().map(|(i, p)| read_alignment(&format!("{output}/t{i}.json"), p.as_ref().map_err(|e| e.clone())?)).collect())
 }
 
-/// Vowels, nasals and approximants are voiced whatever the pitch tracker said: it gave up on many
-/// loud vowel frames, and a frame stored as unvoiced plays as pure noise. A little noise stays.
+/// The sound's label decides its voicing floor: the pitch tracker fails on nasals, on voiced
+/// consonants and on quiet vowels, and a frame stored as unvoiced plays as hiss. Voiced consonants
+/// keep some noise; vowels, nasals and approximants a little.
 fn mark_voiced(an: &mut Analysis, times: &[(String, f64, f64, usize)]) {
     let count = an.frames.len() as isize;
     if count == 0 {
@@ -479,20 +480,37 @@ fn mark_voiced(an: &mut Analysis, times: &[(String, f64, f64, usize)]) {
     }
     let frame = |t: f64| (((t - 0.0125) / 0.01).round() as isize).clamp(0, count - 1) as usize;
     for (ipa, t0, t1, _) in times {
-        if matches!(ipa.trim_end_matches('\''), "a" | "e" | "i" | "u" | "æ" | "ɑ" | "ɒ" | "ɔ" | "ə" | "ɛ" | "ɪ" | "ʊ" | "ʌ" | "ɐ" | "m" | "n" | "ŋ" | "l" | "ɫ" | "ɹ" | "w" | "j") {
-            for i in frame(*t0)..=frame(*t1) {
-                let f = &mut an.frames[i];
-                if f.gain >= 70 {
-                    f.voiced = f.voiced.max(14);
-                }
-            }
+        let least = match ipa.trim_end_matches('\'') {
+            "a" | "e" | "i" | "u" | "æ" | "ɑ" | "ɒ" | "ɔ" | "ə" | "ɛ" | "ɪ" | "ʊ" | "ʌ" | "ɐ" | "m" | "n" | "ŋ" | "l" | "ɫ" | "ɹ" | "w" | "j" => 14,
+            "z" | "v" | "ð" | "ʒ" | "b" | "d" | "g" => 10,
+            "dʒ" => 8,
+            _ => continue,
+        };
+        for i in frame(*t0)..=frame(*t1) {
+            let f = &mut an.frames[i];
+            f.voiced = f.voiced.max(least);
         }
     }
 }
 
+/// Every take at the same speech level (the loudest half of its 20 ms blocks), so that joins from a
+/// louder take don't jump out next to joins from a quieter one.
+fn level_take(x: &[f32]) -> Vec<f32> {
+    const TARGET_RMS: f64 = 0.01585; // -36 dB, about where the speaker's takes already sit
+    let mut blocks: Vec<f64> = x.chunks_exact(320).map(|b| b.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / 320.0).collect();
+    if blocks.is_empty() {
+        return x.to_vec();
+    }
+    blocks.sort_by(f64::total_cmp);
+    let top = &blocks[blocks.len() / 2..];
+    let rms = (top.iter().sum::<f64>() / top.len() as f64).sqrt().max(1e-9);
+    let gain = (TARGET_RMS / rms).clamp(0.25, 4.0) as f32;
+    x.iter().map(|v| v * gain).collect()
+}
+
 fn analysis_of(take: &Take) -> Result<Analysis, String> {
     let mine = read_wav(&take.wav)?;
-    Ok(analyze(&resample(&mine, FS, FS_OUT)))
+    Ok(analyze(&level_take(&resample(&mine, FS, FS_OUT))))
 }
 
 fn align_take(take: &Take, times: &Result<PhoneTimes, String>) -> Result<(Vec<Candidate>, Analysis), String> {
@@ -896,7 +914,10 @@ pub fn events_for(g2p: &EnglishG2P, voice: &LoadedVoice, text: &str, c: &Charact
                 }
                 let phone = phone_id(&labels[k]).or_else(|| phone_id(&s.ipa)).unwrap_or(schwa);
                 // the speaker's median shortens every example of a vowel, but "do" and "you" still need saying
+                let single = in_phrase.iter().filter(|x| x.word == span.word).flat_map(|x| x.first..x.first + x.count).filter(|&v| planned.segments[v].kind == "vowel").count() == 1;
                 let floor = match labels[k].as_str() {
+                    // a word with no other vowel ("or", "her", "of") collapses without this
+                    "ə" if single => 0.07,
                     "ə" => 0.055,
                     "i" | "ɪ" | "ɛ" | "æ" | "ɑ" | "ɒ" | "ɔ" | "ʊ" | "u" | "ʌ" | "ɐ" => 0.08,
                     _ => 0.0,

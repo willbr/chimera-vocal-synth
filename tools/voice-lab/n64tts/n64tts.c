@@ -8,7 +8,7 @@
 #define ENTRY_BYTES 10
 
 #define SEAM 960 /* samples over which neighbouring joins are blended: 60 ms */
-#define SEAM_MIN_GAIN 70 /* below this a frame is near silence, with no shape worth matching */
+#define SEAM_MIN_GAIN 30 /* below this a frame is near silence, with no shape worth matching */
 
 typedef long long i64;
 
