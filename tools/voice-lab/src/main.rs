@@ -46,6 +46,11 @@ fn notes_path() -> String {
     format!("{}/notes.jsonl", lab_dir())
 }
 
+/// The next sentence to show, passing over any marked in `skip`.
+fn next_prompt(skip: &[bool], from: usize, forward: bool) -> Option<usize> {
+    if forward { (from + 1..skip.len()).find(|&i| !skip[i]) } else { (0..from).rev().find(|&i| !skip[i]) }
+}
+
 fn characters_path() -> String {
     format!("{}/characters.json", lab_dir())
 }
@@ -116,6 +121,9 @@ struct App {
     prompts: Vec<String>,
     prompt: usize,
     prompt_done: Vec<bool>,
+    /// recorded before this launch: the takes of this session stay reachable, to redo a mistake
+    prompt_old: Vec<bool>,
+    skip_old: bool,
     recording_prompt: Option<usize>,
     g2p: Option<chimera::phonetics::english::EnglishG2P>,
     loaded: Option<voice::LoadedVoice>,
@@ -168,6 +176,8 @@ impl App {
             prompts: Vec::new(),
             prompt: 0,
             prompt_done: Vec::new(),
+            prompt_old: Vec::new(),
+            skip_old: true,
             recording_prompt: None,
             g2p: None,
             loaded: voice::load(&voice_path()).ok(),
@@ -192,6 +202,7 @@ impl App {
         app.prompts = std::fs::read_to_string(repo_path("out/voice-lab/prompts.txt")).map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect()).unwrap_or_default();
         app.prompts.extend(include_str!("../books/alice-prompts.txt").lines().map(str::to_string));
         app.prompt_done = (0..app.prompts.len()).map(|i| Path::new(&prompt_wav(i)).exists()).collect();
+        app.prompt_old = app.prompt_done.clone();
         app.prompt = app.prompt_done.iter().position(|d| !d).unwrap_or(0);
         app.load_report();
         app
@@ -305,6 +316,11 @@ impl App {
         });
     }
 
+    fn step_prompt(&self, from: usize, forward: bool) -> Option<usize> {
+        let none = vec![false; self.prompts.len()];
+        next_prompt(if self.skip_old { &self.prompt_old } else { &none }, from, forward)
+    }
+
     fn toggle_prompt_recording(&mut self) {
         if self.recording_prompt.is_some() {
             let (Some(r), Some(i)) = (self.recording.take(), self.recording_prompt.take()) else { return };
@@ -321,8 +337,10 @@ impl App {
                         String::new()
                     };
                     // a good take moves on by itself; a bad one stays so it can be redone
-                    if self.status.is_empty() && i + 1 < self.prompts.len() {
-                        self.prompt = i + 1;
+                    if self.status.is_empty() {
+                        if let Some(next) = self.step_prompt(i, true) {
+                            self.prompt = next;
+                        }
                     }
                 }
                 Err(e) => self.status = format!("Couldn't save: {e}"),
@@ -364,18 +382,20 @@ impl App {
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!locked && self.prompt > 0, egui::Button::new("◀ Back")).clicked() {
-                    self.prompt -= 1;
+                let (back, next) = (self.step_prompt(self.prompt, false), self.step_prompt(self.prompt, true));
+                if ui.add_enabled(!locked && back.is_some(), egui::Button::new("◀ Back")).clicked() {
+                    self.prompt = back.unwrap_or(self.prompt);
                     self.status.clear();
                 }
-                if ui.add_enabled(!locked && self.prompt + 1 < self.prompts.len(), egui::Button::new("Next ▶")).clicked() {
-                    self.prompt += 1;
+                if ui.add_enabled(!locked && next.is_some(), egui::Button::new("Next ▶")).clicked() {
+                    self.prompt = next.unwrap_or(self.prompt);
                     self.status.clear();
                 }
                 if ui.add_enabled(!locked && self.prompt_done[self.prompt], egui::Button::new("▶ Play this take")).clicked() {
                     self.play_path(&prompt_wav(self.prompt));
                 }
                 ui.label(format!("Sentence {}", self.prompt + 1));
+                ui.checkbox(&mut self.skip_old, "Skip sentences from earlier sessions");
             });
             ui.add_space(14.0);
             ui.separator();
@@ -1234,4 +1254,19 @@ fn main() -> Result<(), String> {
         }),
     )
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_prompt;
+
+    #[test]
+    fn reading_on_passes_over_sentences_from_earlier_sessions() {
+        // after the one sentence an earlier session missed, the next is the first new one, not its old neighbour
+        let skip = [true, false, true, true, false];
+        assert_eq!(next_prompt(&skip, 1, true), Some(4));
+        assert_eq!(next_prompt(&skip, 4, false), Some(1));
+        assert_eq!(next_prompt(&skip, 4, true), None);
+        assert_eq!(next_prompt(&skip, 1, false), None);
+    }
 }
