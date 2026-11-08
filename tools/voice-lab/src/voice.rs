@@ -547,6 +547,10 @@ fn align_take(take: &Take, times: &Result<PhoneTimes, String>) -> Result<(Vec<Ca
 }
 
 const SHAPE_POINTS: usize = 16;
+/// How many examples of one join a voice may hold: the C library's MAX_EXAMPLES.
+const MAX_EXAMPLES: usize = 3;
+/// The voice's share of the ROM.
+const MAX_VOICE_BYTES: usize = 290_000;
 
 /// An example's filter and loudness at evenly spaced points, half each side of its join. Near
 /// silent frames count for little (their filter is noise); low resonances count most.
@@ -576,6 +580,7 @@ pub struct BuildReport {
     pub rom_bytes: usize,
     pub failed: usize,
     pub single_example_joins: usize,
+    pub extra_examples: usize,
 }
 
 /// Build a voice file from takes. Whisper runs once for all of them.
@@ -668,7 +673,8 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
         groups.entry((id[&c.a], id[&c.b])).or_default().push(c);
     }
     let single_example_joins = groups.values().filter(|g| g.len() == 1).count();
-    let mut best: BTreeMap<(u8, u8), (f64, Candidate)> = BTreeMap::new();
+    let mut best: BTreeMap<(u8, u8), Vec<Candidate>> = BTreeMap::new();
+    let mut extras: Vec<(usize, usize, (u8, u8), Candidate)> = Vec::new();
     for ((a, b), mut group) in groups {
         // a side only one frame long has no transition left to play ("would" lost its d)
         let whole = |c: &Candidate| c.join >= 2 && c.frames.len() - c.join >= 2;
@@ -689,29 +695,55 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
             along + 0.5 * (distance(&c.frames[0], &mean[&a]) + distance(&c.frames[c.frames.len() - 1], &mean[&b]))
         };
         let scores: Vec<f64> = (0..group.len()).map(score).collect();
-        let pick = (0..group.len()).min_by(|x, y| scores[*x].total_cmp(&scores[*y])).unwrap_or(0);
-        let total = scores[pick];
-        if let Some(chosen) = group.into_iter().nth(pick) {
-            best.insert((a, b), (total, chosen));
+        let mut order: Vec<usize> = (0..group.len()).collect();
+        order.sort_by(|x, y| scores[*x].total_cmp(&scores[*y]));
+        // only examples nearly as typical as the best are worth a choice
+        let worst_kept = scores[order[0]] * 1.5;
+        let size = group.len();
+        let mut slots: Vec<Option<Candidate>> = group.into_iter().map(Some).collect();
+        for (rank, &k) in order.iter().enumerate().take(MAX_EXAMPLES) {
+            if rank > 0 && scores[k] > worst_kept {
+                break;
+            }
+            let Some(c) = slots[k].take() else { continue };
+            if rank == 0 {
+                best.insert((a, b), vec![c]);
+            } else {
+                extras.push((rank, size, (a, b), c));
+            }
+        }
+    }
+    // second examples before third, commonest joins first, as far as the budget goes
+    extras.sort_by_key(|e| (e.0, std::cmp::Reverse(e.1)));
+    let mut bytes: usize = 1200 + best.values().flatten().map(|c| c.frames.len() * FRAME_BYTES + 10).sum::<usize>();
+    let mut extra_examples = 0;
+    for (_, _, key, c) in extras {
+        let cost = c.frames.len() * FRAME_BYTES + 10;
+        if bytes + cost <= MAX_VOICE_BYTES {
+            bytes += cost;
+            extra_examples += 1;
+            best.entry(key).or_default().push(c);
         }
     }
 
     let mut index = Vec::new();
     let mut frames_bytes = Vec::new();
-    for ((a, b), (_, c)) in &best {
-        index.push(Entry { a: *a, b: *b, offset: (frames_bytes.len() / FRAME_BYTES) as u32, frames: c.frames.len() as u16, join: c.join as u16 });
-        // a piece from the end of a sentence is much quieter than one from the middle: bring each
-        // end to its sound's usual level, ramping across the piece so its own shape survives
-        // next to silence a piece keeps its own level: speech really does fade at the end of a phrase
-        let silence = id[SILENCE];
-        let left = if *b == silence { 0.0 } else { (usual_gain[a] - c.frames[0].gain as f64).clamp(-48.0, 48.0) };
-        let right = if *a == silence { 0.0 } else { (usual_gain[b] - c.frames[c.frames.len() - 1].gain as f64).clamp(-48.0, 48.0) };
-        let last = (c.frames.len() - 1).max(1) as f64;
-        for (i, f) in c.frames.iter().enumerate() {
-            let t = i as f64 / last;
-            frames_bytes.extend_from_slice(&f.lsf);
-            frames_bytes.push((f.gain as f64 + left * (1.0 - t) + right * t).round().clamp(0.0, 255.0) as u8);
-            frames_bytes.push(f.voiced);
+    for ((a, b), list) in &best {
+        for c in list {
+            index.push(Entry { a: *a, b: *b, offset: (frames_bytes.len() / FRAME_BYTES) as u32, frames: c.frames.len() as u16, join: c.join as u16 });
+            // a piece from the end of a sentence is much quieter than one from the middle: bring each
+            // end to its sound's usual level, ramping across the piece so its own shape survives.
+            // Next to silence a piece keeps its own level: speech really does fade at the end of a phrase
+            let silence = id[SILENCE];
+            let left = if *b == silence { 0.0 } else { (usual_gain[a] - c.frames[0].gain as f64).clamp(-48.0, 48.0) };
+            let right = if *a == silence { 0.0 } else { (usual_gain[b] - c.frames[c.frames.len() - 1].gain as f64).clamp(-48.0, 48.0) };
+            let last = (c.frames.len() - 1).max(1) as f64;
+            for (i, f) in c.frames.iter().enumerate() {
+                let t = i as f64 / last;
+                frames_bytes.extend_from_slice(&f.lsf);
+                frames_bytes.push((f.gain as f64 + left * (1.0 - t) + right * t).round().clamp(0.0, 255.0) as u8);
+                frames_bytes.push(f.voiced);
+            }
         }
     }
 
@@ -741,7 +773,7 @@ pub fn build(takes: &[Take], work_dir: &str, out_path: &str, status: &(dyn Fn(&s
         let _ = std::fs::create_dir_all(dir);
     }
     std::fs::write(out_path, &file).map_err(|e| format!("{out_path}: {e}"))?;
-    Ok(BuildReport { takes: takes.len() - failed, phones: phones.len(), joins: index.len(), frames: frames_bytes.len() / FRAME_BYTES, rom_bytes: file.len(), failed, single_example_joins })
+    Ok(BuildReport { takes: takes.len() - failed, phones: phones.len(), joins: index.len(), frames: frames_bytes.len() / FRAME_BYTES, rom_bytes: file.len(), failed, single_example_joins, extra_examples })
 }
 
 fn voice_file(phones: &[String], scales: &[u8], pulse: &[i16], index: &[Entry], frames_bytes: &[u8]) -> Vec<u8> {

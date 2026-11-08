@@ -7,6 +7,9 @@
 #define FRAME_BYTES N64TTS_FRAME_BYTES
 #define ENTRY_BYTES 10
 
+#define MAX_EXAMPLES 3 /* stored examples of one join that can be chosen between */
+#define MAX_PATH 1024 /* sounds in one utterance that get a choice; any beyond use the first example */
+#define RANK_COST 128 /* how much a worse-ranked example must save at its seams to be chosen */
 #define SEAM 960 /* samples over which neighbouring joins are blended: 60 ms */
 #define SEAM_MIN_GAIN 30 /* below this a frame is near silence, with no shape worth matching */
 
@@ -81,8 +84,8 @@ static unsigned int lower_bound(const n64tts_voice *v, unsigned int key)
 }
 
 /* Find the frames joining a to b. A join never recorded borrows its halves from other joins. */
-static void find_halves(const n64tts_voice *v, unsigned int a, unsigned int b, half_t *left,
-                        half_t *right, n64tts_stats *stats)
+static void find_halves(const n64tts_voice *v, unsigned int a, unsigned int b, unsigned int which,
+                        half_t *left, half_t *right, n64tts_stats *stats)
 {
     unsigned int i = lower_bound(v, (a << 8) | b);
     const unsigned char *e;
@@ -91,7 +94,10 @@ static void find_halves(const n64tts_voice *v, unsigned int a, unsigned int b, h
     if (i < v->joins) {
         e = v->index + i * ENTRY_BYTES;
         if (e[0] == a && e[1] == b) {
-            unsigned int join = read_u16(e + 8);
+            unsigned int join;
+            if (i + which < v->joins && e[which * ENTRY_BYTES] == a && e[which * ENTRY_BYTES + 1] == b)
+                e += which * ENTRY_BYTES;
+            join = read_u16(e + 8);
             left->offset = read_u32(e + 2);
             left->frames = join;
             right->offset = left->offset + join;
@@ -220,12 +226,103 @@ static const unsigned char *frame_at(const n64tts_voice *v, const half_t *h, uns
     return h->frames ? v->frames + (h->offset + i) * FRAME_BYTES : 0;
 }
 
+/* How many stored examples of a -> b there are to choose from; a borrowed join has just one. */
+static unsigned int examples_of(const n64tts_voice *v, unsigned int a, unsigned int b)
+{
+    unsigned int i = lower_bound(v, (a << 8) | b), n = 0;
+    while (n < MAX_EXAMPLES && i + n < v->joins && v->index[(i + n) * ENTRY_BYTES] == a &&
+           v->index[(i + n) * ENTRY_BYTES + 1] == b)
+        n++;
+    return n ? n : 1u;
+}
+
+/* How badly two stored frames meet. Near silence only loudness matters. */
+static unsigned int meet_cost(const unsigned char *x, const unsigned char *y)
+{
+    int k, d = (int)x[ORDER] - (int)y[ORDER];
+    unsigned int cost = (unsigned int)(d < 0 ? -d : d) * 2u;
+    if (x[ORDER] < SEAM_MIN_GAIN || y[ORDER] < SEAM_MIN_GAIN)
+        return cost;
+    for (k = 0; k < ORDER; k++) {
+        d = (int)x[k] - (int)y[k];
+        cost += (unsigned int)(d < 0 ? -d : d) * (k < 10 ? 2u : 1u);
+    }
+    return cost;
+}
+
+/* Which example comes first for join p: each repeat of a join starts from the next example, so
+ * "down, down, down" isn't one recording three times. */
+static unsigned int rotation_of(const n64tts_event *events, unsigned int p, unsigned int n)
+{
+    unsigned int q, seen = 0;
+    for (q = (p > 8u ? p - 8u : 0u); q < p; q++)
+        if (events[q].phone == events[p].phone && events[q + 1].phone == events[p + 1].phone)
+            seen++;
+    return seen % n;
+}
+
+/* Choose one example per join: the cheapest chain through the utterance (Viterbi). Runs once per
+ * utterance, before any audio, and only touches the index and each example's two end frames. */
+static void choose_examples(const n64tts_voice *v, const n64tts_event *events, unsigned int count,
+                            unsigned char *choice)
+{
+    unsigned char back[MAX_PATH][MAX_EXAMPLES];
+    unsigned int cost[MAX_EXAMPLES], next_cost[MAX_EXAMPLES];
+    const unsigned char *ends[MAX_EXAMPLES], *next_ends[MAX_EXAMPLES];
+    unsigned int pairs = min_u(count - 1, MAX_PATH);
+    unsigned int n, m, p, i, j, rotate, best;
+    half_t l, r;
+    n64tts_stats ignored;
+
+    n = examples_of(v, events[0].phone, events[1].phone);
+    rotate = rotation_of(events, 0, n);
+    for (i = 0; i < n; i++) {
+        find_halves(v, events[0].phone, events[1].phone, i, &l, &r, &ignored);
+        ends[i] = r.frames ? frame_at(v, &r, r.frames - 1) : 0;
+        cost[i] = RANK_COST * ((i + n - rotate) % n);
+    }
+    for (p = 1; p < pairs; p++) {
+        m = examples_of(v, events[p].phone, events[p + 1].phone);
+        rotate = rotation_of(events, p, m);
+        for (j = 0; j < m; j++) {
+            const unsigned char *start;
+            unsigned int smallest = ~0u;
+            find_halves(v, events[p].phone, events[p + 1].phone, j, &l, &r, &ignored);
+            start = frame_at(v, &l, 0);
+            for (i = 0; i < n; i++) {
+                unsigned int c = cost[i] + (ends[i] && start ? meet_cost(ends[i], start) : 0u);
+                if (c < smallest) {
+                    smallest = c;
+                    back[p][j] = (unsigned char)i;
+                }
+            }
+            next_cost[j] = smallest + RANK_COST * ((j + m - rotate) % m);
+            next_ends[j] = r.frames ? frame_at(v, &r, r.frames - 1) : 0;
+        }
+        for (j = 0; j < m; j++) {
+            cost[j] = next_cost[j];
+            ends[j] = next_ends[j];
+        }
+        n = m;
+    }
+    best = 0;
+    for (i = 1; i < n; i++)
+        if (cost[i] < cost[best])
+            best = i;
+    for (p = pairs; p-- > 0;) {
+        choice[p] = (unsigned char)best;
+        if (p > 0)
+            best = back[p][best];
+    }
+}
+
 void n64tts_render(const n64tts_voice *v, const n64tts_event *events, unsigned int count,
                    const n64tts_params *params, short *out, n64tts_stats *stats)
 {
     i64 a[ORDER], history[ORDER];
     unsigned int lsf[ORDER], interp[ORDER];
     half_t left, right;
+    unsigned char choice[MAX_PATH];
     const unsigned char *prev_end = 0, *this_start = 0, *this_end = 0, *next_start = 0;
     unsigned int n = n64tts_output_len(events, count);
     unsigned int pair = 0, pair_start = 0, half_a = 1, half_b = 1, pos = 0;
@@ -239,6 +336,7 @@ void n64tts_render(const n64tts_voice *v, const n64tts_event *events, unsigned i
     stats->borrowed_joins = 0;
     if (n == 0)
         return;
+    choose_examples(v, events, count, choice);
     left.offset = left.frames = right.offset = right.frames = 0;
     for (k = 0; k < ORDER; k++) {
         a[k] = 0;
@@ -260,7 +358,7 @@ void n64tts_render(const n64tts_voice *v, const n64tts_event *events, unsigned i
             ha = ea->samples - ea->samples / 2;
             hb = eb->samples / 2;
             if (!have) {
-                find_halves(v, ea->phone, eb->phone, &left, &right, stats);
+                find_halves(v, ea->phone, eb->phone, pair < MAX_PATH ? choice[pair] : 0u, &left, &right, stats);
                 prev_end = this_end;
                 this_start = frame_at(v, &left, 0);
                 this_end = right.frames ? frame_at(v, &right, right.frames - 1) : 0;
@@ -268,7 +366,8 @@ void n64tts_render(const n64tts_voice *v, const n64tts_event *events, unsigned i
                 if (pair + 2 < count) {
                     half_t next_left, next_right;
                     n64tts_stats ignored;
-                    find_halves(v, eb->phone, events[pair + 2].phone, &next_left, &next_right, &ignored);
+                    find_halves(v, eb->phone, events[pair + 2].phone, pair + 1 < MAX_PATH ? choice[pair + 1] : 0u,
+                                &next_left, &next_right, &ignored);
                     next_start = frame_at(v, &next_left, 0);
                 }
                 half_a = ha ? ha : 1;

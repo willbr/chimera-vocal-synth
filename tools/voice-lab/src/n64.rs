@@ -84,7 +84,8 @@ pub fn render(voice: &Voice, events: &[Event], params: &Params, out: &mut [i16])
 
 /// The working memory one render uses, in bytes: filter state and the list of sounds.
 pub fn ram_bytes(events: usize) -> usize {
-    ORDER * 8 * 2 + ORDER * 4 * 2 + 128 + events * std::mem::size_of::<Event>()
+    // the last term is the choice of examples: three bytes back and one chosen per sound, up to 1024
+    ORDER * 8 * 2 + ORDER * 4 * 2 + 128 + events * std::mem::size_of::<Event>() + 1024 * 4
 }
 
 #[cfg(test)]
@@ -113,6 +114,37 @@ mod tests {
             b.extend_from_slice(&[120, 15]);
         }
         Voice::from_bytes(b).unwrap()
+    }
+
+    /// Two examples of 0→1, the second with its own loudness, and one of 1→0.
+    fn two_example_voice(second_gain: u8) -> Voice {
+        let mut b = b"CVOX\x02\x01a\x40\x01b\x40".to_vec();
+        for k in 0..=256 {
+            let c = (std::f64::consts::PI * k as f64 / 256.0).cos() * 32767.0;
+            b.extend_from_slice(&(c.round() as i16).to_le_bytes());
+        }
+        for k in 0..PULSE_LEN as i32 {
+            b.extend_from_slice(&(if k == 64 { 20000i16 } else { -157 }).to_le_bytes());
+        }
+        b.extend_from_slice(&3u16.to_le_bytes());
+        for (i, (x, y)) in [(0u8, 1u8), (0, 1), (1, 0)].into_iter().enumerate() {
+            b.extend_from_slice(&[x, y]);
+            b.extend_from_slice(&(i as u32 * 4).to_le_bytes());
+            b.extend_from_slice(&4u16.to_le_bytes());
+            b.extend_from_slice(&2u16.to_le_bytes());
+        }
+        for i in 0..12 {
+            b.extend((0..ORDER).map(|k| (k * 15 + 8) as u8));
+            b.extend_from_slice(&[if (4..8).contains(&i) { second_gain } else { 120 }, 15]);
+        }
+        Voice::from_bytes(b).unwrap()
+    }
+
+    #[test]
+    fn a_repeated_join_moves_to_its_next_example() {
+        // the second 0→1 can only differ between these voices if it used the second example
+        let phones = [0, 1, 0, 1, 0];
+        assert_ne!(say(&two_example_voice(120), &phones).0, say(&two_example_voice(121), &phones).0);
     }
 
     fn say(voice: &Voice, phones: &[u8]) -> (Vec<i16>, Stats) {
